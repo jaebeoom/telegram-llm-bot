@@ -34,7 +34,8 @@ MAX_HISTORY = 20
 
 SYSTEM_PROMPT = """You are a helpful assistant. Answer concisely and accurately.
 When search results are provided, use them to give up-to-date answers and cite sources when relevant.
-Respond in the same language the user uses."""
+Respond in the same language the user uses.
+Never use Chinese characters or words in your responses."""
 
 STREAM_EDIT_INTERVAL = 1.5  # 텔레그램 메시지 수정 간격 (초)
 
@@ -62,6 +63,7 @@ def strip_think(text: str) -> str:
     if "<think>" in text and "</think>" in text:
         return text.split("</think>")[-1].strip()
     return text
+
 
 
 # ──────────────────────────────────────────────
@@ -197,7 +199,7 @@ def search_web(query: str) -> str:
         results = tavily.search(
             query=query,
             max_results=5,
-            search_depth="basic",
+            search_depth="advanced",
             include_answer=True,
         )
 
