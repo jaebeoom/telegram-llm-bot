@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import json
 import logging
@@ -35,7 +36,8 @@ MAX_HISTORY = 20
 SYSTEM_PROMPT = """You are a helpful assistant. Answer concisely and accurately.
 When search results are provided, use them to give up-to-date answers and cite sources when relevant.
 Respond in the same language the user uses.
-Never use Chinese characters or words in your responses."""
+Never use Chinese characters or words in your responses.
+Always respond in plain text only. Never use markdown formatting such as **, ##, `, ```, -, or any other markup syntax."""
 
 STREAM_EDIT_INTERVAL = 1.5  # 텔레그램 메시지 수정 간격 (초)
 
@@ -63,6 +65,21 @@ def strip_think(text: str) -> str:
     if "<think>" in text and "</think>" in text:
         return text.split("</think>")[-1].strip()
     return text
+
+
+def strip_markdown(text: str) -> str:
+    """마크다운 서식을 평문으로 변환"""
+    # 코드 블록 (```...```) → 내용만 유지
+    text = re.sub(r"```\w*\n?", "", text)
+    # 인라인 코드 (`...`) → 내용만 유지
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # 볼드/이탤릭 (**, *, __, _)
+    text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
+    text = re.sub(r"_{1,3}([^_]+)_{1,3}", r"\1", text)
+    # 헤더 (##)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # 리스트 마커 (-, *, 1.)는 유지 (가독성)
+    return text.strip()
 
 
 
@@ -160,7 +177,7 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
             if inside_think:
                 continue
 
-            display_text = strip_think(full_text)
+            display_text = strip_markdown(strip_think(full_text))
 
             if not display_text:
                 continue
@@ -175,7 +192,7 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
                     pass  # rate limit 등 무시
 
         # 최종 메시지 업데이트
-        final_text = strip_think(full_text) if full_text else "⚠️ 빈 응답"
+        final_text = strip_markdown(strip_think(full_text)) if full_text else "⚠️ 빈 응답"
 
         if len(final_text) > 4000:
             await bot_msg.edit_text(final_text[:4000])
