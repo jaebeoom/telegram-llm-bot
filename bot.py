@@ -4,7 +4,10 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime
 import requests
+import fitz
+from youtube_transcript_api import YouTubeTranscriptApi
 from dotenv import load_dotenv
 from tavily import TavilyClient
 from telegram import Update
@@ -32,11 +35,14 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
 # 대화 기록 (user_id별)
 conversations: dict[int, list[dict]] = {}
-last_activity: dict[int, float] = {}
-MAX_HISTORY = 20
-INACTIVITY_TIMEOUT = 30 * 60
+last_activity: dict[int, float] = {}  # user_id → 마지막 활동 timestamp
+MAX_HISTORY = 10
+INACTIVITY_TIMEOUT = 30 * 60  # 30분 (초)
+MAX_PDF_CHARS = 20000
+MAX_TRANSCRIPT_CHARS = 20000
 
-SYSTEM_PROMPT = """You are a helpful assistant. Answer concisely and accurately.
+SYSTEM_PROMPT = f"""You are a helpful assistant. Answer concisely and accurately.
+Today's date is {datetime.now().strftime('%Y-%m-%d')}. Content shared by the user (X posts, articles, PDFs, YouTube transcripts) reflects real, current events — not fiction or speculation. Treat them as factual present-day information.
 When search results are provided, use them to give up-to-date answers and cite sources when relevant.
 Respond in the same language the user uses.
 Never use Chinese characters or words in your responses.
@@ -90,6 +96,7 @@ def strip_markdown(text: str) -> str:
 # 대화 히스토리 준비
 # ──────────────────────────────────────────────
 def cleanup_inactive():
+    """비활성 유저의 대화 기록 자동 정리"""
     now = time.time()
     expired = [uid for uid, ts in last_activity.items() if now - ts > INACTIVITY_TIMEOUT]
     for uid in expired:
@@ -109,7 +116,7 @@ def prepare_messages(user_id: int, user_message: str, search_context: str = "") 
 
     if search_context:
         augmented_message = (
-            f"[Web Search Results]\n{search_context}\n\n"
+            f"{search_context}\n\n"
             f"[User Question]\n{user_message}"
         )
     else:
@@ -220,9 +227,103 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
 
         conversations[user_id].append({"role": "assistant", "content": final_text})
 
+        # 알림 트리거: 임시 메시지 전송 후 즉시 삭제
+        try:
+            notify_msg = await update.message.reply_text("✅")
+            await notify_msg.delete()
+        except Exception:
+            pass
+
     except Exception as e:
         logger.error(f"LLM error: {e}")
         await bot_msg.edit_text(f"⚠️ LM Studio 연결 실패: {e}")
+
+
+# ──────────────────────────────────────────────
+# X(Twitter) 피드 추출
+# ──────────────────────────────────────────────
+TWEET_URL_PATTERN = re.compile(r"https?://(?:twitter\.com|x\.com)/\w+/status/(\d+)")
+
+
+def extract_tweet(tweet_id: str) -> str | None:
+    """fxtwitter API로 X 피드 텍스트 추출"""
+    try:
+        r = requests.get(f"https://api.fxtwitter.com/status/{tweet_id}", timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        tweet = data.get("tweet", {})
+        name = tweet.get("author", {}).get("name", "Unknown")
+        text = tweet.get("text", "") or tweet.get("raw_text", {}).get("text", "")
+        created = tweet.get("created_at", "")
+
+        # 아티클(장문 포스트) 감지 → content.blocks에서 본문 추출
+        article = tweet.get("article")
+        if article:
+            title = article.get("title", "")
+            blocks = article.get("content", {}).get("blocks", [])
+            body = "\n".join(b.get("text", "") for b in blocks if b.get("text"))
+            if body:
+                body = body[:MAX_PDF_CHARS]  # 길이 제한 재활용
+                return f"[X Article]\n작성자: {name}\n제목: {title}\nDate: {created}\n\n{body}"
+
+        # 일반 피드
+        media = tweet.get("media", {})
+        if not text or text.startswith("https://t.co/"):
+            media_types = [m.get("type", "unknown") for m in media.get("all", [])]
+            desc = f"[미디어: {', '.join(media_types)}]" if media_types else "[텍스트 없음]"
+            return f"[X Post]\n{name}: {desc}\nDate: {created}"
+        return f"[X Post]\n{name}: {text}\nDate: {created}"
+    except Exception as e:
+        logger.error(f"X post extraction error: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────
+# PDF 텍스트 추출
+# ──────────────────────────────────────────────
+def extract_pdf_text(file_bytes: bytes) -> str | None:
+    """pymupdf로 PDF 바이트에서 텍스트 추출"""
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        pages = []
+        total = 0
+        for page in doc:
+            text = page.get_text()
+            if total + len(text) > MAX_PDF_CHARS:
+                pages.append(text[: MAX_PDF_CHARS - total])
+                break
+            pages.append(text)
+            total += len(text)
+        doc.close()
+        result = "\n".join(pages).strip()
+        if not result:
+            return None
+        return f"[PDF Document]\n{result}"
+    except Exception as e:
+        logger.error(f"PDF extraction error: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────
+# YouTube 스크립트 추출
+# ──────────────────────────────────────────────
+YOUTUBE_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})"
+)
+
+
+def extract_youtube_transcript(video_id: str) -> str | None:
+    """youtube-transcript-api로 스크립트 추출"""
+    try:
+        api = YouTubeTranscriptApi()
+        transcript = api.fetch(video_id, languages=["ko", "en"])
+        text = " ".join(s.text for s in transcript.snippets)
+        if not text:
+            return None
+        return f"[YouTube Transcript]\n{text[:MAX_TRANSCRIPT_CHARS]}"
+    except Exception as e:
+        logger.error(f"YouTube transcript error: {e}")
+        return None
 
 
 # ──────────────────────────────────────────────
@@ -237,7 +338,7 @@ def search_web(query: str) -> str:
             include_answer=True,
         )
 
-        output_parts = []
+        output_parts = ["[Web Search Results]"]
 
         if results.get("answer"):
             output_parts.append(f"Summary: {results['answer']}")
@@ -277,6 +378,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
+    # X/Twitter URL 감지
+    tweet_match = TWEET_URL_PATTERN.search(user_text)
+    if tweet_match:
+        tweet_id = tweet_match.group(1)
+        tweet_context = await asyncio.to_thread(extract_tweet, tweet_id)
+        if tweet_context:
+            # URL 제거 후 남은 텍스트를 user message로
+            user_msg = TWEET_URL_PATTERN.sub("", user_text).strip()
+            if user_msg:
+                await stream_reply(update, user_id, user_msg, tweet_context)
+            else:
+                # URL만 보낸 경우: 컨텍스트 저장만
+                prepare_messages(user_id, tweet_context)
+                await update.message.reply_text("📖 피드를 읽었어요. 질문해 주세요!")
+            return
+        else:
+            await update.message.reply_text("⚠️ 피드를 가져올 수 없습니다.")
+            return
+
+    # YouTube URL 감지
+    yt_match = YOUTUBE_URL_PATTERN.search(user_text)
+    if yt_match:
+        video_id = yt_match.group(1)
+        await update.message.reply_text("🎬 스크립트 추출 중...")
+        yt_context = await asyncio.to_thread(extract_youtube_transcript, video_id)
+        if yt_context:
+            user_msg = YOUTUBE_URL_PATTERN.sub("", user_text).strip()
+            if user_msg:
+                await stream_reply(update, user_id, user_msg, yt_context)
+            else:
+                prepare_messages(user_id, yt_context)
+                await update.message.reply_text("🎬 스크립트를 읽었어요. 질문해 주세요!")
+            return
+        else:
+            await update.message.reply_text("⚠️ 스크립트를 가져올 수 없습니다. (스크립트가 없는 영상일 수 있어요)")
+            return
+
     await stream_reply(update, user_id, user_text)
 
 
@@ -294,6 +432,33 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 검색 중...")
     search_results = await asyncio.to_thread(search_web, query)
     await stream_reply(update, user_id, query, search_results)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ 접근 권한이 없습니다.")
+        return
+
+    doc = update.message.document
+    if doc.mime_type != "application/pdf":
+        return
+
+    await update.message.reply_text("📄 PDF 읽는 중...")
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+    pdf_context = await asyncio.to_thread(extract_pdf_text, bytes(file_bytes))
+
+    if not pdf_context:
+        await update.message.reply_text("⚠️ PDF에서 텍스트를 추출할 수 없습니다.")
+        return
+
+    caption = update.message.caption or ""
+    if caption.strip():
+        await stream_reply(update, user_id, caption.strip(), pdf_context)
+    else:
+        prepare_messages(user_id, pdf_context)
+        await update.message.reply_text("📄 PDF를 읽었어요. 질문해 주세요!")
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,6 +483,7 @@ def main():
     app.add_handler(CommandHandler("search", handle_search))
     app.add_handler(CommandHandler("c", clear_history))
     app.add_handler(CommandHandler("m", show_model))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot started!")
