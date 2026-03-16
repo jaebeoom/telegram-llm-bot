@@ -3,6 +3,7 @@ import re
 import asyncio
 import json
 import logging
+import time
 import requests
 from dotenv import load_dotenv
 from tavily import TavilyClient
@@ -31,7 +32,9 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 
 # 대화 기록 (user_id별)
 conversations: dict[int, list[dict]] = {}
+last_activity: dict[int, float] = {}
 MAX_HISTORY = 20
+INACTIVITY_TIMEOUT = 30 * 60
 
 SYSTEM_PROMPT = """You are a helpful assistant. Answer concisely and accurately.
 When search results are provided, use them to give up-to-date answers and cite sources when relevant.
@@ -86,9 +89,23 @@ def strip_markdown(text: str) -> str:
 # ──────────────────────────────────────────────
 # 대화 히스토리 준비
 # ──────────────────────────────────────────────
+def cleanup_inactive():
+    now = time.time()
+    expired = [uid for uid, ts in last_activity.items() if now - ts > INACTIVITY_TIMEOUT]
+    for uid in expired:
+        conversations.pop(uid, None)
+        last_activity.pop(uid, None)
+    if expired:
+        logger.info(f"Auto-cleared {len(expired)} inactive session(s)")
+
+
 def prepare_messages(user_id: int, user_message: str, search_context: str = "") -> list:
+    cleanup_inactive()
+
     if user_id not in conversations:
         conversations[user_id] = []
+
+    last_activity[user_id] = time.time()
 
     if search_context:
         augmented_message = (
@@ -245,8 +262,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 LLM 봇 준비 완료!\n\n"
         "💬 일반 메시지 → LLM 대화\n"
         "🔍 /s 질문 → 웹 검색 + LLM 답변\n"
-        "🗑️ /clear → 대화 기록 초기화\n"
-        "ℹ️ /model → 현재 모델 확인"
+        "🗑️ /c → 대화 기록 초기화\n"
+        "ℹ️ /m → 현재 모델 확인"
     )
 
 
@@ -282,6 +299,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversations.pop(user_id, None)
+    last_activity.pop(user_id, None)
     await update.message.reply_text("🗑️ 대화 기록 초기화 완료.")
 
 
@@ -298,8 +316,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("s", handle_search))
     app.add_handler(CommandHandler("search", handle_search))
-    app.add_handler(CommandHandler("clear", clear_history))
-    app.add_handler(CommandHandler("model", show_model))
+    app.add_handler(CommandHandler("c", clear_history))
+    app.add_handler(CommandHandler("m", show_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot started!")
