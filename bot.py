@@ -413,9 +413,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_msg:
                 await stream_reply(update, user_id, user_msg, tweet_context)
             else:
-                # URL만 보낸 경우: 컨텍스트 저장만
-                prepare_messages(user_id, tweet_context)
-                await update.message.reply_text("📖 피드를 읽었어요. 질문해 주세요!")
+                await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", tweet_context)
             return
         else:
             await update.message.reply_text("⚠️ 피드를 가져올 수 없습니다.")
@@ -432,8 +430,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if user_msg:
                 await stream_reply(update, user_id, user_msg, yt_context)
             else:
-                prepare_messages(user_id, yt_context)
-                await update.message.reply_text("🎬 스크립트를 읽었어요. 질문해 주세요!")
+                await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", yt_context)
             return
         else:
             await update.message.reply_text("⚠️ 스크립트를 가져올 수 없습니다. (스크립트가 없는 영상일 수 있어요)")
@@ -451,7 +448,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await stream_reply(update, user_id, user_msg, web_context)
             else:
                 prepare_messages(user_id, web_context)
-                await update.message.reply_text("📖 웹페이지를 읽었어요. 질문해 주세요!")
+                await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", web_context)
             return
         else:
             await update.message.reply_text("⚠️ 웹페이지에서 텍스트를 추출할 수 없습니다.")
@@ -509,7 +506,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await stream_reply(update, user_id, caption.strip(), pdf_context)
     else:
         prepare_messages(user_id, pdf_context)
-        await update.message.reply_text("📄 PDF를 읽었어요. 질문해 주세요!")
+        await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", pdf_context)
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
