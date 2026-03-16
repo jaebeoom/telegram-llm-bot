@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 import requests
 import fitz
+import trafilatura
 from youtube_transcript_api import YouTubeTranscriptApi
 from dotenv import load_dotenv
 from tavily import TavilyClient
@@ -242,7 +243,8 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
 # ──────────────────────────────────────────────
 # X(Twitter) 피드 추출
 # ──────────────────────────────────────────────
-TWEET_URL_PATTERN = re.compile(r"https?://(?:twitter\.com|x\.com)/\w+/status/(\d+)")
+TWEET_URL_PATTERN = re.compile(r"https?://(?:twitter\.com|x\.com)/\w+/status/(\d+)(?:\?\S*)?")
+
 
 
 def extract_tweet(tweet_id: str) -> str | None:
@@ -323,6 +325,28 @@ def extract_youtube_transcript(video_id: str) -> str | None:
         return f"[YouTube Transcript]\n{text[:MAX_TRANSCRIPT_CHARS]}"
     except Exception as e:
         logger.error(f"YouTube transcript error: {e}")
+        return None
+
+
+# ──────────────────────────────────────────────
+# 일반 웹페이지 텍스트 추출
+# ──────────────────────────────────────────────
+GENERAL_URL_PATTERN = re.compile(r"https?://\S+")
+MAX_WEB_CHARS = 20000
+
+
+def extract_web_text(url: str) -> str | None:
+    """trafilatura로 웹페이지 본문 추출"""
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return None
+        text = trafilatura.extract(downloaded)
+        if not text:
+            return None
+        return f"[Web Article]\nURL: {url}\n\n{text[:MAX_WEB_CHARS]}"
+    except Exception as e:
+        logger.error(f"Web extraction error: {e}")
         return None
 
 
@@ -413,6 +437,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         else:
             await update.message.reply_text("⚠️ 스크립트를 가져올 수 없습니다. (스크립트가 없는 영상일 수 있어요)")
+            return
+
+    # 일반 URL 감지 (X, YouTube에 해당하지 않는 URL)
+    url_match = GENERAL_URL_PATTERN.search(user_text)
+    if url_match:
+        url = url_match.group(0)
+        await update.message.reply_text("📖 웹페이지 읽는 중...")
+        web_context = await asyncio.to_thread(extract_web_text, url)
+        if web_context:
+            user_msg = GENERAL_URL_PATTERN.sub("", user_text).strip()
+            if user_msg:
+                await stream_reply(update, user_id, user_msg, web_context)
+            else:
+                prepare_messages(user_id, web_context)
+                await update.message.reply_text("📖 웹페이지를 읽었어요. 질문해 주세요!")
+            return
+        else:
+            await update.message.reply_text("⚠️ 웹페이지에서 텍스트를 추출할 수 없습니다.")
+            return
+
+    # 메시지 끝에 /s가 있으면 검색 모드
+    if user_text.rstrip().endswith("/s"):
+        query = user_text.rstrip()[:-2].strip()
+        if query:
+            await update.message.reply_text("🔍 검색 중...")
+            search_results = await asyncio.to_thread(search_web, query)
+            await stream_reply(update, user_id, query, search_results)
             return
 
     await stream_reply(update, user_id, user_text)

@@ -10,4 +10,5 @@ dependencies = [
     "python-dotenv>=1.0",
     "pymupdf>=1.24",
     "youtube-transcript-api>=1.0.0",
+    "trafilatura>=1.6",
 ]
