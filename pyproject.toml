@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Telegram bot with LM Studio + Tavily search"
 requires-python = ">=3.11"
 dependencies = [
-    "python-telegram-bot>=21.0",
+    "python-telegram-bot[job-queue]>=21.0",
     "requests>=2.31",
     "tavily-python>=0.3",
     "python-dotenv>=1.0",
