@@ -38,7 +38,7 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY)
 conversations: dict[int, list[dict]] = {}
 last_activity: dict[int, float] = {}  # user_id → 마지막 활동 timestamp
 MAX_HISTORY = 10
-INACTIVITY_TIMEOUT = 30 * 60  # 30분 (초)
+INACTIVITY_TIMEOUT = 3 * 60 * 60  # 3시간 (초)
 MAX_PDF_CHARS = 20000
 MAX_TRANSCRIPT_CHARS = 20000
 
@@ -96,20 +96,22 @@ def strip_markdown(text: str) -> str:
 # ──────────────────────────────────────────────
 # 대화 히스토리 준비
 # ──────────────────────────────────────────────
-def cleanup_inactive():
-    """비활성 유저의 대화 기록 자동 정리"""
+async def cleanup_inactive(context: ContextTypes.DEFAULT_TYPE):
+    """비활성 유저의 대화 기록 자동 정리 (job queue에서 주기적 실행)"""
     now = time.time()
     expired = [uid for uid, ts in last_activity.items() if now - ts > INACTIVITY_TIMEOUT]
     for uid in expired:
         conversations.pop(uid, None)
         last_activity.pop(uid, None)
+        try:
+            await context.bot.send_message(chat_id=uid, text="🗑️ 3시간 동안 비활성 상태여서 대화 기록을 자동 초기화했어요.")
+        except Exception:
+            pass
     if expired:
         logger.info(f"Auto-cleared {len(expired)} inactive session(s)")
 
 
 def prepare_messages(user_id: int, user_message: str, search_context: str = "") -> list:
-    cleanup_inactive()
-
     if user_id not in conversations:
         conversations[user_id] = []
 
@@ -533,6 +535,9 @@ def main():
     app.add_handler(CommandHandler("m", show_model))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # 10분마다 비활성 세션 정리 체크
+    app.job_queue.run_repeating(cleanup_inactive, interval=600, first=600)
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
