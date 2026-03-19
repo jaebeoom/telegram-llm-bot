@@ -337,6 +337,17 @@ GENERAL_URL_PATTERN = re.compile(r"https?://\S+")
 MAX_WEB_CHARS = 20000
 
 
+def extract_pdf_from_url(url: str) -> str | None:
+    """URL에서 PDF 다운로드 후 텍스트 추출"""
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        return extract_pdf_text(r.content)
+    except Exception as e:
+        logger.error(f"PDF URL extraction error: {e}")
+        return None
+
+
 def extract_web_text(url: str) -> str | None:
     """trafilatura로 웹페이지 본문 추출"""
     try:
@@ -442,18 +453,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url_match = GENERAL_URL_PATTERN.search(user_text)
     if url_match:
         url = url_match.group(0)
+        user_msg = GENERAL_URL_PATTERN.sub("", user_text).strip()
+
+        # PDF URL 감지
+        if url.lower().endswith(".pdf"):
+            await update.message.reply_text("📄 PDF 다운로드 중...")
+            pdf_context = await asyncio.to_thread(extract_pdf_from_url, url)
+            if pdf_context:
+                if user_msg:
+                    await stream_reply(update, user_id, user_msg, pdf_context)
+                else:
+                    await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", pdf_context)
+                return
+            else:
+                await update.message.reply_text("⚠️ PDF에서 텍스트를 추출할 수 없습니다.")
+                return
+
+        # 일반 웹페이지
         await update.message.reply_text("📖 웹페이지 읽는 중...")
         web_context = await asyncio.to_thread(extract_web_text, url)
         if web_context:
-            user_msg = GENERAL_URL_PATTERN.sub("", user_text).strip()
             if user_msg:
                 await stream_reply(update, user_id, user_msg, web_context)
             else:
-                prepare_messages(user_id, web_context)
                 await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", web_context)
             return
         else:
-            await update.message.reply_text("⚠️ 웹페이지에서 텍스트를 추출할 수 없습니다.")
+            await update.message.reply_text("⚠️ 웹페이지에서 텍스트를 추출할 수 없습니다. (JavaScript 기반 페이지는 지원되지 않아요)")
             return
 
     # 메시지 끝에 /s가 있으면 검색 모드
