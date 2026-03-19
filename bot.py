@@ -340,7 +340,8 @@ MAX_WEB_CHARS = 20000
 def extract_pdf_from_url(url: str) -> str | None:
     """URL에서 PDF 다운로드 후 텍스트 추출"""
     try:
-        r = requests.get(url, timeout=30)
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
+        r = requests.get(url, timeout=30, headers=headers)
         r.raise_for_status()
         return extract_pdf_text(r.content)
     except Exception as e:
