@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from pathlib import Path
 from datetime import datetime
 import requests
 import fitz
@@ -30,6 +31,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "YOUR_TAVILY_API_KEY")
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
 ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.5-27b")
+VAULT_HAIKU_PATH = os.getenv("VAULT_HAIKU_PATH", "")
 
 # Tavily 클라이언트
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
@@ -56,6 +58,75 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────
+# Vault 로그 저장
+# ──────────────────────────────────────────────
+def save_session_to_vault(user_id: int) -> bool:
+    """세션 종료 시 대화 전체를 Vault/Logs에 MD로 저장"""
+    if not VAULT_HAIKU_PATH:
+        return False
+
+    history = conversations.get(user_id)
+    if not history:
+        return False
+
+    logs_dir = Path(VAULT_HAIKU_PATH).expanduser()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_file = logs_dir / f"{today}.md"
+
+    # 대화를 MD로 포맷
+    now = datetime.now().strftime("%H:%M")
+    session_md = f"\n\n---\n\n## AI 세션 ({now}, {MODEL_NAME})\n\n"
+
+    for msg in history:
+        role = msg["role"]
+        content = msg["content"]
+
+        if role == "user":
+            # 검색 컨텍스트가 포함된 경우, [User Question] 이후만 표시
+            if "[User Question]" in content:
+                parts = content.split("[User Question]")
+                context_part = parts[0].strip()
+                question_part = parts[1].strip() if len(parts) > 1 else ""
+
+                # 컨텍스트 소스 종류 감지
+                source_type = "참고 자료"
+                if "[X Post]" in context_part or "[X Article]" in context_part:
+                    source_type = "X 포스트"
+                elif "[YouTube Transcript]" in context_part:
+                    source_type = "YouTube"
+                elif "[Web Article]" in context_part:
+                    source_type = "웹 아티클"
+                elif "[Web Search Results]" in context_part:
+                    source_type = "웹 검색"
+                elif "[PDF Document]" in context_part:
+                    source_type = "PDF"
+
+                session_md += f"**나** ({source_type} 첨부): {question_part}\n\n"
+            else:
+                session_md += f"**나**: {content}\n\n"
+        elif role == "assistant":
+            session_md += f"**AI**: {content}\n\n"
+
+    # 태그 추가
+    session_md += "#haiku #daily #from/telegram-bot\n"
+
+    # 파일이 있으면 추가, 없으면 헤더 포함 생성
+    if log_file.exists():
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(session_md)
+    else:
+        weekday = datetime.now().strftime("%A")
+        header = f"# {today} {weekday}\n"
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write(header + session_md)
+
+    logger.info(f"Session saved to vault: {log_file}")
+    return True
 
 
 # ──────────────────────────────────────────────
@@ -101,10 +172,14 @@ async def cleanup_inactive(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
     expired = [uid for uid, ts in last_activity.items() if now - ts > INACTIVITY_TIMEOUT]
     for uid in expired:
+        saved = save_session_to_vault(uid)
         conversations.pop(uid, None)
         last_activity.pop(uid, None)
         try:
-            await context.bot.send_message(chat_id=uid, text="🗑️ 3시간 동안 비활성 상태여서 대화 기록을 자동 초기화했어요.")
+            msg = "🗑️ 3시간 동안 비활성 상태여서 대화 기록을 자동 초기화했어요."
+            if saved:
+                msg += "\n📝 Vault에 자동 저장됨."
+            await context.bot.send_message(chat_id=uid, text=msg)
         except Exception:
             pass
     if expired:
@@ -397,12 +472,14 @@ def search_web(query: str) -> str:
 # 핸들러
 # ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vault_status = "✅ 연결됨" if VAULT_HAIKU_PATH else "❌ 미설정"
     await update.message.reply_text(
         "🤖 LLM 봇 준비 완료!\n\n"
         "💬 일반 메시지 → LLM 대화\n"
         "🔍 /s 질문 → 웹 검색 + LLM 답변\n"
-        "🗑️ /c → 대화 기록 초기화\n"
-        "ℹ️ /m → 현재 모델 확인"
+        "🗑️ /c → 대화 기록 초기화 + Vault 저장\n"
+        "ℹ️ /m → 현재 모델 확인\n\n"
+        f"📂 Vault: {vault_status}"
     )
 
 
@@ -540,9 +617,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    saved = save_session_to_vault(user_id)
     conversations.pop(user_id, None)
     last_activity.pop(user_id, None)
-    await update.message.reply_text("🗑️ 대화 기록 초기화 완료.")
+    msg = "🗑️ 대화 기록 초기화 완료."
+    if saved:
+        msg += "\n📝 Vault에 자동 저장됨."
+    await update.message.reply_text(msg)
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
