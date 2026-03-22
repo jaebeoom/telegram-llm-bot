@@ -172,14 +172,14 @@ async def cleanup_inactive(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
     expired = [uid for uid, ts in last_activity.items() if now - ts > INACTIVITY_TIMEOUT]
     for uid in expired:
-        saved = save_session_to_vault(uid)
+        save_session_to_vault(uid)
         conversations.pop(uid, None)
         last_activity.pop(uid, None)
         try:
-            msg = "🗑️ 3시간 동안 비활성 상태여서 대화 기록을 자동 초기화했어요."
-            if saved:
-                msg += "\n📝 Vault에 자동 저장됨."
-            await context.bot.send_message(chat_id=uid, text=msg)
+            await context.bot.send_message(
+                chat_id=uid,
+                text="🗑️ 3시간 동안 비활성 상태여서 대화 기록을 자동 초기화했어요.",
+            )
         except Exception:
             pass
     if expired:
@@ -617,13 +617,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    saved = save_session_to_vault(user_id)
+    save_session_to_vault(user_id)
     conversations.pop(user_id, None)
     last_activity.pop(user_id, None)
-    msg = "🗑️ 대화 기록 초기화 완료."
-    if saved:
-        msg += "\n📝 Vault에 자동 저장됨."
-    await update.message.reply_text(msg)
+    await update.message.reply_text("🗑️ 대화 기록 초기화 완료.")
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
