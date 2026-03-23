@@ -7,9 +7,6 @@ import time
 from pathlib import Path
 from datetime import datetime
 import requests
-import fitz
-import trafilatura
-from youtube_transcript_api import YouTubeTranscriptApi
 from dotenv import load_dotenv
 from tavily import TavilyClient
 from telegram import Update
@@ -19,6 +16,17 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ContextTypes,
+)
+from tagger import generate_tags
+from extractors import (
+    TWEET_URL_PATTERN,
+    YOUTUBE_URL_PATTERN,
+    GENERAL_URL_PATTERN,
+    extract_tweet,
+    extract_pdf_text,
+    extract_pdf_from_url,
+    extract_youtube_transcript,
+    extract_web_text,
 )
 
 load_dotenv()
@@ -41,8 +49,6 @@ conversations: dict[int, list[dict]] = {}
 last_activity: dict[int, float] = {}  # user_id → 마지막 활동 timestamp
 MAX_HISTORY = 10
 INACTIVITY_TIMEOUT = 3 * 60 * 60  # 3시간 (초)
-MAX_PDF_CHARS = 20000
-MAX_TRANSCRIPT_CHARS = 20000
 
 SYSTEM_PROMPT = f"""You are a helpful assistant. Answer concisely and accurately.
 Today's date is {datetime.now().strftime('%Y-%m-%d')}. Content shared by the user (X posts, articles, PDFs, YouTube transcripts) reflects real, current events — not fiction or speculation. Treat them as factual present-day information.
@@ -113,7 +119,8 @@ def save_session_to_vault(user_id: int) -> bool:
             session_md += f"**AI**: {content}\n\n"
 
     # 태그 추가
-    session_md += "#haiku #daily #from/telegram-bot\n"
+    tags = generate_tags(history)
+    session_md += f"{tags}\n"
 
     # 파일이 있으면 추가, 없으면 헤더 포함 생성
     if log_file.exists():
@@ -316,127 +323,6 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
         logger.error(f"LLM error: {e}")
         await bot_msg.edit_text(f"⚠️ LM Studio 연결 실패: {e}")
 
-
-# ──────────────────────────────────────────────
-# X(Twitter) 피드 추출
-# ──────────────────────────────────────────────
-TWEET_URL_PATTERN = re.compile(r"https?://(?:twitter\.com|x\.com)/\w+/status/(\d+)(?:\?\S*)?")
-
-
-
-def extract_tweet(tweet_id: str) -> str | None:
-    """fxtwitter API로 X 피드 텍스트 추출"""
-    try:
-        r = requests.get(f"https://api.fxtwitter.com/status/{tweet_id}", timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        tweet = data.get("tweet", {})
-        name = tweet.get("author", {}).get("name", "Unknown")
-        text = tweet.get("text", "") or tweet.get("raw_text", {}).get("text", "")
-        created = tweet.get("created_at", "")
-
-        # 아티클(장문 포스트) 감지 → content.blocks에서 본문 추출
-        article = tweet.get("article")
-        if article:
-            title = article.get("title", "")
-            blocks = article.get("content", {}).get("blocks", [])
-            body = "\n".join(b.get("text", "") for b in blocks if b.get("text"))
-            if body:
-                body = body[:MAX_PDF_CHARS]  # 길이 제한 재활용
-                return f"[X Article]\n작성자: {name}\n제목: {title}\nDate: {created}\n\n{body}"
-
-        # 일반 피드
-        media = tweet.get("media", {})
-        if not text or text.startswith("https://t.co/"):
-            media_types = [m.get("type", "unknown") for m in media.get("all", [])]
-            desc = f"[미디어: {', '.join(media_types)}]" if media_types else "[텍스트 없음]"
-            return f"[X Post]\n{name}: {desc}\nDate: {created}"
-        return f"[X Post]\n{name}: {text}\nDate: {created}"
-    except Exception as e:
-        logger.error(f"X post extraction error: {e}")
-        return None
-
-
-# ──────────────────────────────────────────────
-# PDF 텍스트 추출
-# ──────────────────────────────────────────────
-def extract_pdf_text(file_bytes: bytes) -> str | None:
-    """pymupdf로 PDF 바이트에서 텍스트 추출"""
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        pages = []
-        total = 0
-        for page in doc:
-            text = page.get_text()
-            if total + len(text) > MAX_PDF_CHARS:
-                pages.append(text[: MAX_PDF_CHARS - total])
-                break
-            pages.append(text)
-            total += len(text)
-        doc.close()
-        result = "\n".join(pages).strip()
-        if not result:
-            return None
-        return f"[PDF Document]\n{result}"
-    except Exception as e:
-        logger.error(f"PDF extraction error: {e}")
-        return None
-
-
-# ──────────────────────────────────────────────
-# YouTube 스크립트 추출
-# ──────────────────────────────────────────────
-YOUTUBE_URL_PATTERN = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})"
-)
-
-
-def extract_youtube_transcript(video_id: str) -> str | None:
-    """youtube-transcript-api로 스크립트 추출"""
-    try:
-        api = YouTubeTranscriptApi()
-        transcript = api.fetch(video_id, languages=["ko", "en"])
-        text = " ".join(s.text for s in transcript.snippets)
-        if not text:
-            return None
-        return f"[YouTube Transcript]\n{text[:MAX_TRANSCRIPT_CHARS]}"
-    except Exception as e:
-        logger.error(f"YouTube transcript error: {e}")
-        return None
-
-
-# ──────────────────────────────────────────────
-# 일반 웹페이지 텍스트 추출
-# ──────────────────────────────────────────────
-GENERAL_URL_PATTERN = re.compile(r"https?://\S+")
-MAX_WEB_CHARS = 20000
-
-
-def extract_pdf_from_url(url: str) -> str | None:
-    """URL에서 PDF 다운로드 후 텍스트 추출"""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
-        r = requests.get(url, timeout=30, headers=headers)
-        r.raise_for_status()
-        return extract_pdf_text(r.content)
-    except Exception as e:
-        logger.error(f"PDF URL extraction error: {e}")
-        return None
-
-
-def extract_web_text(url: str) -> str | None:
-    """trafilatura로 웹페이지 본문 추출"""
-    try:
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
-            return None
-        text = trafilatura.extract(downloaded)
-        if not text:
-            return None
-        return f"[Web Article]\nURL: {url}\n\n{text[:MAX_WEB_CHARS]}"
-    except Exception as e:
-        logger.error(f"Web extraction error: {e}")
-        return None
 
 
 # ──────────────────────────────────────────────
