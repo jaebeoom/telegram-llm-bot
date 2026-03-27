@@ -36,7 +36,9 @@ load_dotenv()
 # ──────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "YOUR_TAVILY_API_KEY")
-LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
+LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL") or os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER_NAME", "OMLX")
 ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.5-27b")
 VAULT_HAIKU_PATH = os.getenv("VAULT_HAIKU_PATH", "")
@@ -64,6 +66,18 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def build_chat_completions_url() -> str:
+    """OpenAI-compatible base URL에서 chat/completions endpoint 생성."""
+    return f"{LLM_API_BASE_URL.rstrip('/')}/chat/completions"
+
+
+def build_llm_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    return headers
 
 
 # ──────────────────────────────────────────────
@@ -232,7 +246,8 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
 
     try:
         r = requests.post(
-            f"{LM_STUDIO_URL}/chat/completions",
+            build_chat_completions_url(),
+            headers=build_llm_headers(),
             json={
                 "model": MODEL_NAME,
                 "messages": messages,
@@ -321,7 +336,7 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
 
     except Exception as e:
         logger.error(f"LLM error: {e}")
-        await bot_msg.edit_text(f"⚠️ LM Studio 연결 실패: {e}")
+        await bot_msg.edit_text(f"⚠️ {LLM_PROVIDER_NAME} 연결 실패: {e}")
 
 
 

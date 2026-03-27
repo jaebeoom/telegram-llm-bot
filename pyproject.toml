@@ -1,7 +1,7 @@
 [project]
 name = "telegram-llm-bot"
 version = "0.1.0"
-description = "Telegram bot with LM Studio + Tavily search"
+description = "Telegram bot with OMLX-compatible local LLM + Tavily search"
 requires-python = ">=3.11"
 dependencies = [
     "python-telegram-bot[job-queue]>=21.0",

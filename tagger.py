@@ -61,7 +61,7 @@ _WORD_BOUNDARY_KEYWORDS: dict[str, str] = {
     "AI": "#tech/ai",
     "LLM": "#tech/ai",
     "GPT": "#tech/ai",
-    "LM Studio": "#tech/ai",
+    "OMLX": "#tech/ai",
     "Claude": "#tech/ai",
     "OpenAI": "#tech/ai",
     "PER": "#investing/valuation",
