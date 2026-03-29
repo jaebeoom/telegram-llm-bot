@@ -10,6 +10,7 @@ import requests
 from dotenv import load_dotenv
 from tavily import TavilyClient
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -318,12 +319,16 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
         # 최종 메시지 업데이트
         final_text = strip_markdown(strip_think(full_text)) if full_text else "⚠️ 빈 응답"
 
-        if len(final_text) > 4000:
-            await bot_msg.edit_text(final_text[:4000])
-            for i in range(4000, len(final_text), 4000):
-                await update.message.reply_text(final_text[i : i + 4000])
-        else:
-            await bot_msg.edit_text(final_text)
+        try:
+            if len(final_text) > 4000:
+                await bot_msg.edit_text(final_text[:4000])
+                for i in range(4000, len(final_text), 4000):
+                    await update.message.reply_text(final_text[i : i + 4000])
+            else:
+                await bot_msg.edit_text(final_text)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
 
         conversations[user_id].append({"role": "assistant", "content": final_text})
 
