@@ -1,0 +1,10 @@
+.env
+.DS_Store
+.idea/
+.claude/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+bot.log
+img
