@@ -37,6 +37,22 @@ REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 }
+_META_DESCRIPTION_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\'](?:og:description|twitter:description|description)["\'][^>]+content=["\'](.*?)["\']',
+    re.IGNORECASE | re.DOTALL,
+)
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_X_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com"}
+_NOISE_SNIPPETS = (
+    "you can see a list of supported browsers in our help center",
+    "we’ve detected that javascript is disabled in this browser",
+    "we've detected that javascript is disabled in this browser",
+    "browser is no longer supported",
+    "this browser is no longer supported",
+    "enable javascript",
+    "sign in to x",
+    "join x today",
+)
 
 
 def _is_private_hostname(hostname: str) -> bool:
@@ -88,6 +104,33 @@ def _validate_public_url(url: str) -> str:
     return url
 
 
+def _is_x_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").removeprefix("www.").casefold()
+    return host in _X_HOSTS
+
+
+def _clean_extracted_text(text: str | None, limit: int) -> str | None:
+    if not text:
+        return None
+    clipped = text.strip()[:limit]
+    lowered = " ".join(clipped.split()).casefold()
+    if any(snippet in lowered for snippet in _NOISE_SNIPPETS):
+        return None
+    return clipped if clipped else None
+
+
+def _extract_meta_text(html: str, limit: int) -> str | None:
+    for pattern in (_META_DESCRIPTION_RE, _TITLE_RE):
+        match = pattern.search(html[:20000])
+        if not match:
+            continue
+        text = re.sub(r"\s+", " ", match.group(1)).strip()
+        cleaned = _clean_extracted_text(text, limit)
+        if cleaned:
+            return cleaned
+    return None
+
+
 def _download_public_url(url: str) -> bytes:
     current_url = _validate_public_url(url)
 
@@ -130,6 +173,24 @@ def _download_public_url(url: str) -> bytes:
     raise ValueError("리다이렉트가 너무 많습니다.")
 
 
+def _extract_tweet_from_html(url: str) -> str | None:
+    parsed = urlparse(url)
+    candidates = [url]
+    if _is_x_url(url):
+        for host in ("fxtwitter.com", "vxtwitter.com"):
+            candidates.append(parsed._replace(netloc=host).geturl())
+
+    for candidate in dict.fromkeys(candidates):
+        try:
+            html = _download_public_url(candidate).decode("utf-8", errors="ignore")
+            text = _extract_meta_text(html, MAX_PDF_CHARS)
+            if text:
+                return f"[X Post]\n{text}"
+        except Exception:
+            continue
+    return None
+
+
 # ──────────────────────────────────────────────
 # X(Twitter)
 # ──────────────────────────────────────────────
@@ -151,7 +212,9 @@ def extract_tweet(tweet_id: str) -> str | None:
             blocks = article.get("content", {}).get("blocks", [])
             body = "\n".join(b.get("text", "") for b in blocks if b.get("text"))
             if body:
-                body = body[:MAX_PDF_CHARS]
+                body = _clean_extracted_text(body, MAX_PDF_CHARS)
+                if not body:
+                    return None
                 return f"[X Article]\n작성자: {name}\n제목: {title}\nDate: {created}\n\n{body}"
 
         # 일반 피드
@@ -160,10 +223,22 @@ def extract_tweet(tweet_id: str) -> str | None:
             media_types = [m.get("type", "unknown") for m in media.get("all", [])]
             desc = f"[미디어: {', '.join(media_types)}]" if media_types else "[텍스트 없음]"
             return f"[X Post]\n{name}: {desc}\nDate: {created}"
-        return f"[X Post]\n{name}: {text}\nDate: {created}"
+        cleaned = _clean_extracted_text(text, MAX_PDF_CHARS)
+        if cleaned:
+            return f"[X Post]\n{name}: {cleaned}\nDate: {created}"
     except Exception as e:
         logger.error(f"X post extraction error: {e}")
+    return None
+
+
+def extract_tweet_from_url(url: str) -> str | None:
+    match = TWEET_URL_PATTERN.search(url)
+    if not match:
         return None
+    extracted = extract_tweet(match.group(1))
+    if extracted:
+        return extracted
+    return _extract_tweet_from_html(url)
 
 
 # ──────────────────────────────────────────────
@@ -223,6 +298,8 @@ def extract_youtube_transcript(video_id: str) -> str | None:
 # ──────────────────────────────────────────────
 def extract_web_text(url: str) -> str | None:
     """trafilatura로 웹페이지 본문 추출"""
+    if _is_x_url(url):
+        return None
     try:
         downloaded = _download_public_url(url).decode("utf-8", errors="ignore")
         if not downloaded:
@@ -230,7 +307,10 @@ def extract_web_text(url: str) -> str | None:
         text = trafilatura.extract(downloaded)
         if not text:
             return None
-        return f"[Web Article]\nURL: {url}\n\n{text[:MAX_WEB_CHARS]}"
+        cleaned = _clean_extracted_text(text, MAX_WEB_CHARS)
+        if not cleaned:
+            return None
+        return f"[Web Article]\nURL: {url}\n\n{cleaned}"
     except Exception as e:
         logger.error(f"Web extraction error: {e}")
         return None

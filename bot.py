@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from tavily import TavilyClient
@@ -22,7 +23,7 @@ from extractors import (
     TWEET_URL_PATTERN,
     YOUTUBE_URL_PATTERN,
     GENERAL_URL_PATTERN,
-    extract_tweet,
+    extract_tweet_from_url,
     extract_pdf_text,
     extract_pdf_from_url,
     extract_youtube_transcript,
@@ -412,8 +413,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # X/Twitter URL 감지
     tweet_match = TWEET_URL_PATTERN.search(user_text)
     if tweet_match:
-        tweet_id = tweet_match.group(1)
-        tweet_context = await asyncio.to_thread(extract_tweet, tweet_id)
+        tweet_context = await asyncio.to_thread(extract_tweet_from_url, tweet_match.group(0))
         if tweet_context:
             # URL 제거 후 남은 텍스트를 user message로
             user_msg = TWEET_URL_PATTERN.sub("", user_text).strip()
