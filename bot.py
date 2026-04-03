@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 import requests
@@ -65,6 +66,7 @@ Never use Chinese or Japanese characters in your responses.
 Always respond in plain text only. Never use markdown formatting such as **, ##, `, ```, -, or any other markup syntax."""
 
 STREAM_EDIT_INTERVAL = 1.5  # 텔레그램 메시지 수정 간격 (초)
+DEFAULT_CONTEXT_PROMPT = "이 내용을 간단히 요약해줘."
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -239,6 +241,64 @@ def prepare_messages(user_id: int, user_message: str, search_context: str = "") 
     return [{"role": "system", "content": SYSTEM_PROMPT}] + conversations[user_id]
 
 
+def build_context_prompt(user_message: str) -> str:
+    stripped = user_message.strip()
+    return stripped or DEFAULT_CONTEXT_PROMPT
+
+
+def _stream_llm_response(messages: list[dict], loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
+    try:
+        with requests.post(
+            build_chat_completions_url(),
+            headers=build_llm_headers(),
+            json={
+                "model": MODEL_NAME,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 2048,
+                "stream": True,
+            },
+            stream=True,
+            timeout=120,
+        ) as response:
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+
+                line_str = line.decode("utf-8")
+                if not line_str.startswith("data: "):
+                    continue
+
+                data_str = line_str[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk["choices"][0].get("delta", {})
+                    token = delta.get("content", "")
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+
+                if token:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("token", token))
+
+        loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+    except Exception as e:
+        loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
+
+
+async def stream_context_reply(
+    update: Update,
+    user_id: int,
+    user_message: str,
+    search_context: str,
+):
+    await stream_reply(update, user_id, build_context_prompt(user_message), search_context)
+
+
 # ──────────────────────────────────────────────
 # 스트리밍 LLM 호출 + 텔레그램 메시지 수정
 # ──────────────────────────────────────────────
@@ -253,42 +313,19 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
     last_edit_time = 0
     inside_think = False
     think_notified = False
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+    worker = asyncio.create_task(asyncio.to_thread(_stream_llm_response, messages, loop, queue))
 
     try:
-        r = requests.post(
-            build_chat_completions_url(),
-            headers=build_llm_headers(),
-            json={
-                "model": MODEL_NAME,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 2048,
-                "stream": True,
-            },
-            stream=True,
-            timeout=120,
-        )
-        r.raise_for_status()
-
-        for line in r.iter_lines():
-            if not line:
-                continue
-
-            line_str = line.decode("utf-8")
-            if not line_str.startswith("data: "):
-                continue
-
-            data_str = line_str[6:]
-            if data_str.strip() == "[DONE]":
+        while True:
+            event, payload = await queue.get()
+            if event == "done":
                 break
+            if event == "error":
+                raise payload
 
-            try:
-                chunk = json.loads(data_str)
-                delta = chunk["choices"][0].get("delta", {})
-                token = delta.get("content", "")
-            except (json.JSONDecodeError, KeyError, IndexError):
-                continue
-
+            token = payload
             if not token:
                 continue
 
@@ -351,6 +388,9 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
     except Exception as e:
         logger.error(f"LLM error: {e}")
         await bot_msg.edit_text(f"⚠️ {LLM_PROVIDER_NAME} 연결 실패: {e}")
+    finally:
+        with suppress(Exception):
+            await worker
 
 
 
@@ -415,12 +455,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tweet_match:
         tweet_context = await asyncio.to_thread(extract_tweet_from_url, tweet_match.group(0))
         if tweet_context:
-            # URL 제거 후 남은 텍스트를 user message로
             user_msg = TWEET_URL_PATTERN.sub("", user_text).strip()
-            if user_msg:
-                await stream_reply(update, user_id, user_msg, tweet_context)
-            else:
-                await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", tweet_context)
+            await stream_context_reply(update, user_id, user_msg, tweet_context)
             return
         else:
             await update.message.reply_text("⚠️ 피드를 가져올 수 없습니다.")
@@ -434,10 +470,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         yt_context = await asyncio.to_thread(extract_youtube_transcript, video_id)
         if yt_context:
             user_msg = YOUTUBE_URL_PATTERN.sub("", user_text).strip()
-            if user_msg:
-                await stream_reply(update, user_id, user_msg, yt_context)
-            else:
-                await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", yt_context)
+            await stream_context_reply(update, user_id, user_msg, yt_context)
             return
         else:
             await update.message.reply_text("⚠️ 스크립트를 가져올 수 없습니다. (스크립트가 없는 영상일 수 있어요)")
@@ -454,10 +487,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📄 PDF 다운로드 중...")
             pdf_context = await asyncio.to_thread(extract_pdf_from_url, url)
             if pdf_context:
-                if user_msg:
-                    await stream_reply(update, user_id, user_msg, pdf_context)
-                else:
-                    await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", pdf_context)
+                await stream_context_reply(update, user_id, user_msg, pdf_context)
                 return
             else:
                 await update.message.reply_text("⚠️ PDF에서 텍스트를 추출할 수 없습니다.")
@@ -467,10 +497,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📖 웹페이지 읽는 중...")
         web_context = await asyncio.to_thread(extract_web_text, url)
         if web_context:
-            if user_msg:
-                await stream_reply(update, user_id, user_msg, web_context)
-            else:
-                await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", web_context)
+            await stream_context_reply(update, user_id, user_msg, web_context)
             return
         else:
             await update.message.reply_text("⚠️ 웹페이지에서 텍스트를 추출할 수 없습니다. (JavaScript 기반 페이지는 지원되지 않아요)")
@@ -524,11 +551,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     caption = update.message.caption or ""
-    if caption.strip():
-        await stream_reply(update, user_id, caption.strip(), pdf_context)
-    else:
-        prepare_messages(user_id, pdf_context)
-        await stream_reply(update, user_id, "이 내용을 간단히 요약해줘.", pdf_context)
+    await stream_context_reply(update, user_id, caption, pdf_context)
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
