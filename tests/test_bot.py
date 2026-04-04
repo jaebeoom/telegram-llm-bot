@@ -1,5 +1,9 @@
 import asyncio
+import sys
 from types import SimpleNamespace
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot
 
@@ -78,3 +82,27 @@ def test_handle_message_with_x_url_uses_context_reply(monkeypatch):
     asyncio.run(bot.handle_message(update, None))
 
     assert calls == [(7, bot.DEFAULT_CONTEXT_PROMPT, "[X Post]\n본문")]
+
+
+def test_load_environment_loads_project_then_parent_shared(monkeypatch):
+    calls = []
+
+    def fake_exists(self):
+        return self.name in {".env", ".shared-ai.env"}
+
+    def fake_load_dotenv(path, override=False):
+        calls.append((Path(path).name, override))
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    monkeypatch.setattr(bot, "load_dotenv", fake_load_dotenv)
+
+    loaded = bot.load_environment()
+
+    assert loaded == [
+        str(Path(bot.__file__).resolve().parent / ".env"),
+        str(Path(bot.__file__).resolve().parent.parent / ".shared-ai.env"),
+    ]
+    assert calls == [
+        (".env", True),
+        (".shared-ai.env", True),
+    ]

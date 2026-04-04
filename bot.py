@@ -31,7 +31,34 @@ from extractors import (
     extract_web_text,
 )
 
-load_dotenv()
+ENV_FILES_LOADED: list[str] = []
+
+
+def load_environment() -> list[str]:
+    """프로젝트 .env와 상위 공용 env 파일을 순서대로 로드한다.
+
+    상위 공용 파일은 프로젝트 .env보다 우선하도록 마지막에 override=True로 덮어쓴다.
+    """
+
+    root_dir = Path(__file__).resolve().parent
+    candidate_paths = [
+        root_dir / ".env",
+        root_dir.parent / "shared_ai.env",
+        root_dir.parent / ".shared_ai.env",
+        root_dir.parent / "shared-ai.env",
+        root_dir.parent / ".shared-ai.env",
+    ]
+
+    loaded_files: list[str] = []
+    for env_path in candidate_paths:
+        if env_path.exists():
+            load_dotenv(env_path, override=True)
+            loaded_files.append(str(env_path))
+
+    return loaded_files
+
+
+ENV_FILES_LOADED = load_environment()
 
 # ──────────────────────────────────────────────
 # 설정
@@ -73,6 +100,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+if ENV_FILES_LOADED:
+    logger.info("Loaded env files: %s", ", ".join(ENV_FILES_LOADED))
+else:
+    logger.warning("No env files were loaded.")
 
 
 def build_chat_completions_url() -> str:
@@ -563,7 +594,8 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"📦 현재 모델: {MODEL_NAME}")
+    env_hint = Path(ENV_FILES_LOADED[-1]).name if ENV_FILES_LOADED else "process env"
+    await update.message.reply_text(f"📦 현재 모델: {MODEL_NAME}\n🔧 설정 소스: {env_hint}")
 
 
 # ──────────────────────────────────────────────
