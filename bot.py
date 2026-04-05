@@ -106,6 +106,9 @@ else:
     logger.warning("No env files were loaded.")
 
 
+REPLACEMENT_CHAR = "\ufffd"
+
+
 def build_chat_completions_url() -> str:
     """OpenAI-compatible base URL에서 chat/completions endpoint 생성."""
     return f"{LLM_API_BASE_URL.rstrip('/')}/chat/completions"
@@ -221,6 +224,17 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     # 리스트 마커 (-, *, 1.)는 유지 (가독성)
     return text.strip()
+
+
+def contains_replacement_char(text: str) -> bool:
+    return REPLACEMENT_CHAR in text
+
+
+def sanitize_replacement_chars(text: str) -> str:
+    """깨진 유니코드 대체 문자는 사용자에게 보내기 전에 제거한다."""
+    if not text:
+        return text
+    return text.replace(REPLACEMENT_CHAR, "")
 
 
 
@@ -379,7 +393,7 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
             if inside_think:
                 continue
 
-            display_text = strip_markdown(strip_think(full_text))
+            display_text = sanitize_replacement_chars(strip_markdown(strip_think(full_text)))
 
             if not display_text:
                 continue
@@ -394,7 +408,10 @@ async def stream_reply(update: Update, user_id: int, user_message: str, search_c
                     pass  # rate limit 등 무시
 
         # 최종 메시지 업데이트
-        final_text = strip_markdown(strip_think(full_text)) if full_text else "⚠️ 빈 응답"
+        if full_text:
+            final_text = sanitize_replacement_chars(strip_markdown(strip_think(full_text)))
+        else:
+            final_text = "⚠️ 빈 응답"
 
         try:
             if len(final_text) > 4000:

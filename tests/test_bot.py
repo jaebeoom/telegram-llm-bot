@@ -106,3 +106,7 @@ def test_load_environment_loads_project_then_parent_shared(monkeypatch):
         (".env", True),
         (".shared-ai.env", True),
     ]
+
+
+def test_sanitize_replacement_chars_removes_broken_unicode_marker():
+    assert bot.sanitize_replacement_chars("제임스 �(James Hespel)") == "제임스 (James Hespel)"
