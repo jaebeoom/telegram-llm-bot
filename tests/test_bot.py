@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot
+from prompt_profiles import load_prompt_profile, normalize_model_name, render_prompt_profile
 
 
 class DummyFile:
@@ -110,3 +111,47 @@ def test_load_environment_loads_project_then_parent_shared(monkeypatch):
 
 def test_sanitize_replacement_chars_removes_broken_unicode_marker():
     assert bot.sanitize_replacement_chars("제임스 �(James Hespel)") == "제임스 (James Hespel)"
+
+
+def test_normalize_model_name_slugifies_consistently():
+    assert normalize_model_name("Gemma 4 26B A4B 6 bit MLX") == "gemma-4-26b-a4b-6-bit-mlx"
+
+
+def test_load_prompt_profile_includes_base_and_matching_model_rules():
+    profile = load_prompt_profile("Gemma 4 26B A4B 6 bit MLX")
+
+    assert "Answer in Korean." in profile
+    assert "Do not agree by default. Test the premise first." in profile
+
+
+def test_build_system_prompt_includes_runtime_date_and_profile_rules():
+    prompt = bot.build_system_prompt("Gemma 4 26B A4B 6 bit MLX", today=bot.datetime(2026, 4, 5))
+
+    assert "Today's date is 2026-04-05." in prompt
+    assert "Be a thoughtful collaborator, not a cheerleader." in prompt
+
+
+def test_render_prompt_profile_replaces_template_variables():
+    prompt = render_prompt_profile("Gemma 4 26B A4B 6 bit MLX", variables={"today": "2026-04-05"})
+
+    assert "{today}" not in prompt
+    assert "Today's date is 2026-04-05." in prompt
+
+
+def test_render_prompt_profile_keeps_literal_braces():
+    prompts_dir = Path(__file__).resolve().parent / "fixtures" / "prompts-with-braces"
+    prompt = render_prompt_profile("test-model", variables={"today": "2026-04-05"}, prompts_dir=prompts_dir)
+
+    assert 'Return JSON like {"ok": true}.' in prompt
+    assert "Today's date is 2026-04-05." in prompt
+
+
+def test_prepare_messages_builds_fresh_system_prompt(monkeypatch):
+    bot.conversations.clear()
+    bot.last_activity.clear()
+
+    monkeypatch.setattr(bot, "build_system_prompt", lambda model_name: f"prompt-for-{model_name}")
+
+    messages = bot.prepare_messages(42, "안녕")
+
+    assert messages[0] == {"role": "system", "content": f"prompt-for-{bot.MODEL_NAME}"}

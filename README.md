@@ -70,6 +70,31 @@ VAULT_HAIKU_PATH=~/path/to/your/Vault/Haiku
 기존 `LM_STUDIO_URL` 환경 변수도 하위 호환으로 계속 읽습니다.
 `LLM_API_BASE_URL`와 `LM_STUDIO_URL`를 둘 다 설정했다면 `LLM_API_BASE_URL`가 우선합니다.
 `/m` 명령은 현재 모델과 마지막으로 적용된 env 파일 이름을 함께 보여줍니다.
+샘플링 관련 값(`temperature`, `max_tokens`, `top_p` 등)은 봇이 별도로 덮어쓰지 않고 OMLX 같은 서버 쪽 설정을 그대로 따릅니다.
+
+## 프롬프트 프로필
+
+시스템 프롬프트는 코드에 하드코딩하지 않고 아래 파일을 합쳐서 만듭니다.
+
+- `prompts/base.md`: 모든 모델에 공통으로 적용할 기본 규칙
+- `prompts/models/*.md`: 모델별 보정 규칙
+
+모델별 파일은 현재 `MODEL_NAME` 또는 `OMLX_MODEL` 값과 비교해 자동 선택합니다. 파일명이나 frontmatter의 `id`, `match` 값이 모델명과 가장 잘 맞는 항목이 적용됩니다.
+`prompts/base.md`에는 `{today}` 같은 템플릿 변수를 넣을 수 있고, 런타임에 실제 값으로 치환됩니다.
+
+예시:
+
+```md
+---
+id: gemma-4
+match: gemma-4, gemma 4
+---
+
+Be a thoughtful collaborator, not a cheerleader.
+...
+```
+
+새 모델을 튜닝하려면 `prompts/models/` 아래에 같은 형식의 `.md` 파일만 추가하면 됩니다.
 
 ## API 키 발급
 

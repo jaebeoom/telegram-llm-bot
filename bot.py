@@ -20,6 +20,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from tagger import generate_tags
+from prompt_profiles import render_prompt_profile
 from extractors import (
     TWEET_URL_PATTERN,
     YOUTUBE_URL_PATTERN,
@@ -85,12 +86,11 @@ last_activity: dict[int, float] = {}  # user_id → 마지막 활동 timestamp
 MAX_HISTORY = 10
 INACTIVITY_TIMEOUT = 3 * 60 * 60  # 3시간 (초)
 
-SYSTEM_PROMPT = f"""You are a helpful assistant. Answer concisely and accurately.
-Today's date is {datetime.now().strftime('%Y-%m-%d')}. Content shared by the user (X posts, articles, PDFs, YouTube transcripts) reflects real, current events — not fiction or speculation. Treat them as factual present-day information.
-When search results are provided, use them to give up-to-date answers and cite sources when relevant.
-Always respond in Korean, even when the source material or transcript is entirely in English. English technical terms are allowed only when necessary.
-Never use Chinese or Japanese characters in your responses.
-Always respond in plain text only. Never use markdown formatting such as **, ##, `, ```, -, or any other markup syntax."""
+
+def build_system_prompt(model_name: str, today: datetime | None = None) -> str:
+    current_date = (today or datetime.now()).strftime("%Y-%m-%d")
+    return render_prompt_profile(model_name, variables={"today": current_date})
+
 
 STREAM_EDIT_INTERVAL = 1.5  # 텔레그램 메시지 수정 간격 (초)
 DEFAULT_CONTEXT_PROMPT = "이 내용을 간단히 요약해줘."
@@ -283,7 +283,8 @@ def prepare_messages(user_id: int, user_message: str, search_context: str = "") 
     if len(conversations[user_id]) > MAX_HISTORY:
         conversations[user_id] = conversations[user_id][-MAX_HISTORY:]
 
-    return [{"role": "system", "content": SYSTEM_PROMPT}] + conversations[user_id]
+    system_prompt = build_system_prompt(MODEL_NAME)
+    return [{"role": "system", "content": system_prompt}] + conversations[user_id]
 
 
 def build_context_prompt(user_message: str) -> str:
@@ -299,8 +300,6 @@ def _stream_llm_response(messages: list[dict], loop: asyncio.AbstractEventLoop, 
             json={
                 "model": MODEL_NAME,
                 "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 2048,
                 "stream": True,
             },
             stream=True,
