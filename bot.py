@@ -957,10 +957,11 @@ def build_response_rewrite_messages(
         {
             "role": "system",
             "content": (
-                "You rewrite assistant responses so they comply with output rules. "
-                "Return only the corrected final answer. "
-                "Write in Korean only. Do not use Chinese or Japanese characters. "
-                "Do not add apologies or commentary about the rewrite."
+                "You translate assistant responses into Korean so they comply with output rules. "
+                "Preserve the meaning of the previous answer; do not answer the user request again from scratch. "
+                "Return only the translated final answer. "
+                "Use Korean plain text only. Do not use Chinese or Japanese characters. "
+                "Do not add apologies or commentary about the translation."
             ),
         },
         {
@@ -970,7 +971,8 @@ def build_response_rewrite_messages(
                 f"{context_note}\n\n"
                 f"Original user request:\n{user_message}\n\n"
                 f"Previous answer:\n{original_text}\n\n"
-                "Rewrite the previous answer in Korean plain text only. "
+                "Translate the previous answer into Korean plain text only. "
+                "Preserve its meaning and structure as much as possible. "
                 "Translate any Chinese or Japanese text into Korean instead of copying it."
             ).strip(),
         },
@@ -1030,15 +1032,15 @@ async def validate_and_rewrite_response(
             issue,
         )
     except Exception as exc:
-        logger.warning("Response rewrite failed after validation issue=%s: %s", issue, exc)
+        logger.warning("Response translation failed after validation issue=%s: %s", issue, exc)
         return RESPONSE_VALIDATION_FAILURE_TEXT
 
     followup_issue = response_validation_issue(rewritten)
     if followup_issue is not None:
-        logger.warning("Response rewrite still failed validation issue=%s", followup_issue)
+        logger.warning("Response translation still failed validation issue=%s", followup_issue)
         return RESPONSE_VALIDATION_FAILURE_TEXT
 
-    logger.info("Response rewritten after validation issue=%s", issue)
+    logger.info("Response translated after validation issue=%s", issue)
     return rewritten
 
 

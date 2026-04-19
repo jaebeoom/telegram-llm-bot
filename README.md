@@ -86,8 +86,8 @@ RESPONSE_REWRITE_TIMEOUT_SECONDS=45
 | `VAULT_CAPTURE_PATH` | 세션 로그를 Markdown으로 저장할 Vault 경로, 선택 사항. 기존 `VAULT_HAIKU_PATH`도 하위 호환 별칭으로 읽음 |
 | `ENABLE_TELEGRAM_DRAFT_STREAMING` | 기본값 `true`. `false`/`0`으로 두면 `sendMessageDraft` 대신 단일 메시지 `edit_text` 스트리밍 사용 |
 | `DISABLE_THINKING_FOR_CONTEXT` | 기본값 `true`. URL/PDF/웹검색처럼 컨텍스트를 주입한 요청은 `chat_template_kwargs.enable_thinking=false`로 보내 첫 요약 응답을 더 빠르게 만듦 |
-| `ENABLE_RESPONSE_VALIDATION` | 기본값 `true`. 최종 LLM 답변에 중국어/일본어 문자가 포함되면 전송 직전에 한국어 재작성 pass를 한 번 수행 |
-| `RESPONSE_REWRITE_TIMEOUT_SECONDS` | 기본값 `45`. 응답 재작성 pass 제한 시간 |
+| `ENABLE_RESPONSE_VALIDATION` | 기본값 `true`. 최종 LLM 답변에 중국어/일본어 문자가 포함되면 전송 직전에 한국어 번역 pass를 한 번 수행 |
+| `RESPONSE_REWRITE_TIMEOUT_SECONDS` | 기본값 `45`. 응답 번역 pass 제한 시간. 변수 이름은 하위 호환을 위해 유지 |
 | `ENABLE_PLAYWRIGHT_FALLBACK` | 기본값 `true`. 일반 HTML 추출이 실패하면 headless Chromium으로 렌더된 DOM을 다시 읽음 |
 | `PLAYWRIGHT_RENDER_TIMEOUT_MS` | 기본값 `12000`. Playwright 렌더링 최대 대기 시간(ms) |
 | `PLAYWRIGHT_IDLE_TIMEOUT_SECONDS` | 기본값 `600`. fallback 브라우저를 재사용하다가 유휴 상태로 둘 최대 시간(초) |

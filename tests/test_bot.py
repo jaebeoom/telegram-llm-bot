@@ -465,7 +465,7 @@ def test_response_validation_issue_detects_chinese_and_japanese_characters():
     assert bot.response_validation_issue("이 영상은 AI를 설명합니다.") is None
 
 
-def test_validate_and_rewrite_response_uses_fallback_when_rewrite_still_violates(monkeypatch):
+def test_validate_and_rewrite_response_uses_fallback_when_translation_still_violates(monkeypatch):
     monkeypatch.setattr(bot, "ENABLE_RESPONSE_VALIDATION", True)
     monkeypatch.setattr(bot, "rewrite_invalid_response", lambda *_args: "仍然是中文")
 
