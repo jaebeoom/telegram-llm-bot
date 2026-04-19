@@ -202,7 +202,7 @@ def parse_enable_thinking_for_context() -> bool:
     if os.getenv("DISABLE_THINKING_FOR_CONTEXT") is not None:
         return not parse_bool_env("DISABLE_THINKING_FOR_CONTEXT", False)
 
-    return True
+    return False
 
 
 TELEGRAM_RESPONSE_DELIVERY = parse_telegram_response_delivery()

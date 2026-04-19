@@ -59,7 +59,7 @@ TELEGRAM_TOKEN=your_telegram_bot_token
 TAVILY_API_KEY=your_tavily_api_key
 ENABLE_AUTO_SEARCH=true
 TELEGRAM_RESPONSE_DELIVERY=final
-ENABLE_THINKING_FOR_CONTEXT=true
+ENABLE_THINKING_FOR_CONTEXT=false
 LLM_API_BASE_URL=http://127.0.0.1:8001/v1
 LLM_API_KEY=omlx
 LLM_PROVIDER_NAME=OMLX
@@ -87,7 +87,7 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 | `MODEL_NAME` | 사용할 로컬 모델 이름. `OMLX_MODEL`이 없으면 필수 |
 | `OMLX_BASE_URL` / `OMLX_MODEL` / `OMLX_API_KEY` | 각각 `LLM_API_BASE_URL` / `MODEL_NAME` / `LLM_API_KEY`보다 우선하는 OMLX 전용 별칭 |
 | `VAULT_CAPTURE_PATH` | 세션 로그를 Markdown으로 저장할 Vault 경로, 선택 사항. 기존 `VAULT_HAIKU_PATH`도 하위 호환 별칭으로 읽음 |
-| `ENABLE_THINKING_FOR_CONTEXT` | 기본값 `true`. URL/PDF/웹검색처럼 컨텍스트를 주입한 요청도 서버 기본 thinking 설정을 유지 |
+| `ENABLE_THINKING_FOR_CONTEXT` | 기본값 `false`. URL/PDF/웹검색처럼 컨텍스트를 주입한 요청은 `chat_template_kwargs.enable_thinking=false`로 보내 첫 요약 응답을 더 빠르게 만듦 |
 | `ENABLE_TELEGRAM_DRAFT_STREAMING` | 하위 호환 변수. `TELEGRAM_RESPONSE_DELIVERY`가 없을 때만 읽으며, `true`는 `draft`, `false`는 `edit`로 해석 |
 | `DISABLE_THINKING_FOR_CONTEXT` | 하위 호환 변수. `ENABLE_THINKING_FOR_CONTEXT`가 없을 때만 읽음 |
 | `ENABLE_RESPONSE_VALIDATION` | 기본값 `true`. 최종 LLM 답변에 중국어/일본어 문자가 포함되면 전송 직전에 한국어 번역 pass를 수행 |
@@ -106,7 +106,7 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 샘플링 관련 값(`temperature`, `max_tokens`, `top_p` 등)은 봇이 별도로 덮어쓰지 않고 OMLX 같은 서버 쪽 설정을 그대로 따릅니다.
 `TELEGRAM_RESPONSE_DELIVERY=final`은 Telegram에는 최종 답변만 보내지만, 내부 LLM 응답은 계속 스트리밍으로 읽어 timeout, usage, reasoning 메트릭을 유지합니다.
 모바일에서 네이티브 draft 스트리밍을 다시 쓰고 싶다면 `TELEGRAM_RESPONSE_DELIVERY=draft`, 단일 메시지 편집 스트리밍을 쓰고 싶다면 `TELEGRAM_RESPONSE_DELIVERY=edit`로 바꿀 수 있습니다.
-컨텍스트 주입 답변에서 reasoning을 끄고 첫 응답 속도를 우선하려면 `ENABLE_THINKING_FOR_CONTEXT=false`로 바꿀 수 있습니다.
+컨텍스트 주입 답변도 서버 기본 reasoning을 유지하고 싶다면 `ENABLE_THINKING_FOR_CONTEXT=true`로 바꿀 수 있습니다.
 자동 검색은 명시적인 최신성 신호가 있으면 바로 검색하고, 그 외 일반 메시지는 로컬 LLM에 짧은 분류 요청을 보내 `needs_search=true`일 때만 검색합니다. `TAVILY_API_KEY`가 없으면 자동 검색도 비활성화됩니다.
 Playwright fallback을 쓰려면 Python 패키지 설치 외에 `uv run playwright install chromium`도 한 번 실행해야 합니다.
 `TAVILY_API_KEY`가 없으면 일반 대화는 동작하지만 `/s` 검색은 실패합니다.

@@ -881,6 +881,13 @@ def test_parse_enable_thinking_for_context_prefers_positive_flag(monkeypatch):
     assert bot.parse_enable_thinking_for_context() is True
 
 
+def test_parse_enable_thinking_for_context_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("ENABLE_THINKING_FOR_CONTEXT", raising=False)
+    monkeypatch.delenv("DISABLE_THINKING_FOR_CONTEXT", raising=False)
+
+    assert bot.parse_enable_thinking_for_context() is False
+
+
 def test_build_chat_completion_payload_disables_thinking_for_context_when_configured(monkeypatch):
     monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
 
@@ -893,7 +900,7 @@ def test_build_chat_completion_payload_disables_thinking_for_context_when_config
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_build_chat_completion_payload_keeps_thinking_for_context_by_default(monkeypatch):
+def test_build_chat_completion_payload_keeps_thinking_for_context_when_configured(monkeypatch):
     monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", True)
 
     payload = bot.build_chat_completion_payload(
