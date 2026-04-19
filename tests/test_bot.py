@@ -17,11 +17,13 @@ from prompt_profiles import load_prompt_profile, normalize_model_name, render_pr
 def clear_histories():
     bot.conversations.clear()
     bot.session_histories.clear()
+    bot.source_memories.clear()
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
     yield
     bot.conversations.clear()
     bot.session_histories.clear()
+    bot.source_memories.clear()
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
 
@@ -121,6 +123,70 @@ def test_build_context_prompt_uses_default_for_blank_text():
 
 def test_build_context_prompt_keeps_user_text():
     assert bot.build_context_prompt("요약 말고 핵심만") == "요약 말고 핵심만"
+
+
+def test_long_source_context_is_chunked_and_retrieved_representatively():
+    key = session_key(301)
+    long_context = "[Web Article]\n" + "첫 구간 성장 서술. " * 900 + "중간 구간 비용 압박. " * 900
+
+    effective_context, source_kind, source_url, store_context = bot.resolve_source_context_for_request(
+        key,
+        bot.DEFAULT_CONTEXT_PROMPT,
+        long_context,
+        source_kind="web",
+        source_url="https://example.com/article",
+    )
+
+    assert effective_context.startswith("[Retrieved Source Context]")
+    assert "Selection mode: representative" in effective_context
+    assert "Chunks selected:" in effective_context
+    assert len(effective_context) < len(long_context)
+    assert source_kind == "web"
+    assert source_url == "https://example.com/article"
+    assert store_context is True
+    assert bot.source_memories[key][-1].content == long_context.strip()
+
+
+def test_source_followup_retrieves_relevant_chunk_without_storing_retrieval_prompt(monkeypatch):
+    monkeypatch.setattr(bot, "build_system_prompt", lambda model_name: "prompt")
+    key = session_key(302)
+    long_context = (
+        "[Web Article]\n"
+        + "초반부 매출 성장과 제품 전략. " * 800
+        + "수요 신호는 재고 회전, 예약 주문, 기업 고객 전환율에서 확인된다. " * 80
+        + "후반부 비용 구조와 리스크. " * 800
+    )
+    bot.register_source_memory(key, long_context, "web", "https://example.com/article")
+
+    effective_context, source_kind, source_url, store_context = bot.resolve_source_context_for_request(
+        key,
+        "수요 신호만",
+        "",
+    )
+    messages = bot.prepare_messages(
+        key,
+        "수요 신호만",
+        effective_context,
+        source_kind=source_kind,
+        source_url=source_url,
+        store_context_in_history=store_context,
+    )
+
+    assert "Selection mode: relevant" in messages[-1]["content"]
+    assert "재고 회전" in messages[-1]["content"]
+    assert bot.conversations[key][-1] == {"role": "user", "content": "수요 신호만"}
+    assert bot.session_histories[key][-1]["source_kind"] == "web"
+    assert bot.session_histories[key][-1]["source_url"] == "https://example.com/article"
+
+
+def test_source_memory_followup_detection_uses_recent_window():
+    key = session_key(303)
+    bot.register_source_memory(key, "[Web Article]\n본문", "web", "https://example.com/article")
+    for turn in range(5):
+        bot.append_history_message(key, "user", f"일반 질문 {turn}")
+        bot.append_history_message(key, "assistant", f"일반 답변 {turn}")
+
+    assert bot.should_apply_source_followup_rules(key, "이건 어때?") is False
 
 
 def test_normalize_source_url_canonicalizes_x_and_youtube():
@@ -469,6 +535,14 @@ def test_response_validation_issue_detects_chinese_and_japanese_characters():
     assert bot.response_validation_issue("이 영상은 AI를 설명합니다.") is None
 
 
+def test_build_validation_safe_fallback_omits_untranslated_cjk():
+    fallback = bot.build_validation_safe_fallback("핵심은 这个视频 입니다. これは테스트.")
+
+    assert fallback is not None
+    assert "중국어/일본어 원문 표기 생략" in fallback
+    assert bot.response_validation_issue(fallback) is None
+
+
 def test_validate_and_rewrite_response_retries_when_translation_still_violates(monkeypatch):
     monkeypatch.setattr(bot, "ENABLE_RESPONSE_VALIDATION", True)
     monkeypatch.setattr(bot, "RESPONSE_REWRITE_MAX_ATTEMPTS", 3)
@@ -491,7 +565,7 @@ def test_validate_and_rewrite_response_retries_when_translation_still_violates(m
     ]
 
 
-def test_validate_and_rewrite_response_uses_fallback_after_max_translation_attempts(monkeypatch):
+def test_validate_and_rewrite_response_uses_safe_omission_after_max_translation_attempts(monkeypatch):
     monkeypatch.setattr(bot, "ENABLE_RESPONSE_VALIDATION", True)
     monkeypatch.setattr(bot, "RESPONSE_REWRITE_MAX_ATTEMPTS", 2)
     calls = []
@@ -504,8 +578,12 @@ def test_validate_and_rewrite_response_uses_fallback_after_max_translation_attem
 
     result = asyncio.run(bot.validate_and_rewrite_response("这是中文", "요약", "[YouTube Transcript]\n본문"))
 
-    assert result == bot.RESPONSE_VALIDATION_FAILURE_TEXT
+    assert result == (
+        "응답 일부에 번역되지 않은 중국어/일본어 표기가 있어 해당 표기를 생략했습니다.\n\n"
+        f"{bot.CJK_OMISSION_PLACEHOLDER}"
+    )
     assert calls == [1, 2]
+    assert bot.response_validation_issue(result) is None
 
 
 def test_normalize_model_name_slugifies_consistently():

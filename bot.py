@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 import asyncio
@@ -124,6 +126,7 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 # session_histories: /c 저장용 전체 세션 누적 대화
 conversations: dict[SessionKey, list[ChatMessage]] = {}
 session_histories: dict[SessionKey, list[ChatMessage]] = {}
+source_memories: dict[SessionKey, list[SourceMemory]] = {}
 session_identifiers: dict[SessionKey, str] = {}
 last_activity_at_by_session: dict[SessionKey, float] = {}
 MAX_HISTORY_PAIRS = 10
@@ -303,6 +306,8 @@ GENERIC_TABLE_LABELS = {
     "labels",
 }
 FORBIDDEN_RESPONSE_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+FORBIDDEN_RESPONSE_CJK_SPAN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+CJK_OMISSION_PLACEHOLDER = "[중국어/일본어 원문 표기 생략]"
 EXTRACT_ONLY_SUFFIX_RE = re.compile(r"(?:^|\s)/(?:e|extract|raw)\s*$", re.IGNORECASE)
 CONTEXT_HEADER_LABELS = {
     "[X Post]": "X 포스트 원문",
@@ -316,6 +321,61 @@ SOURCE_EXTRACT_LABELS = {
     "youtube": "YouTube 스크립트",
     "pdf": "PDF 텍스트",
     "web": "웹페이지 본문",
+}
+SOURCE_CONTEXT_KINDS = set(SOURCE_EXTRACT_LABELS)
+CONTEXT_HEADER_SOURCE_KINDS = {
+    "[X Post]": "x",
+    "[X Article]": "x",
+    "[YouTube Transcript]": "youtube",
+    "[Web Article]": "web",
+    "[PDF Document]": "pdf",
+}
+SOURCE_DIRECT_CONTEXT_CHARS = 20_000
+SOURCE_RETRIEVAL_CONTEXT_CHARS = 20_000
+SOURCE_CHUNK_CHARS = 4_500
+SOURCE_CHUNK_OVERLAP_CHARS = 450
+SOURCE_RETRIEVAL_MAX_CHUNKS = 5
+SOURCE_MEMORY_LIMIT = 4
+SOURCE_QUERY_TOKEN_RE = re.compile(r"[0-9A-Za-z가-힣]{2,}")
+SOURCE_BROAD_QUERY_RE = re.compile(
+    r"(요약|정리|핵심|전체|내용|줄거리|개요|요지|summary|summarize|overview|tl;?dr|gist)",
+    re.IGNORECASE,
+)
+SOURCE_QUERY_STOPWORDS = {
+    "이거",
+    "이것",
+    "내용",
+    "요약",
+    "정리",
+    "핵심",
+    "전체",
+    "간단히",
+    "한국어",
+    "알려줘",
+    "해줘",
+    "해주세요",
+    "설명",
+    "분석",
+    "그리고",
+    "그래서",
+    "어떻게",
+    "무엇",
+    "뭐야",
+    "관련",
+    "부분",
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "what",
+    "how",
+    "why",
+    "summary",
+    "summarize",
+    "overview",
+    "please",
 }
 SOURCE_FOLLOWUP_SKIP_RE = re.compile(
     r"(다른\s*얘기|다른\s*주제|방금\s*(거|것)\s*무시|컨텍스트\s*무시|원문\s*무시|"
@@ -359,6 +419,28 @@ class ExtractedContext:
 class ContextExtractionResult:
     matched: bool
     extracted: ExtractedContext | None = None
+
+
+@dataclass(frozen=True)
+class SourceChunk:
+    index: int
+    text: str
+    start: int
+    end: int
+    terms: frozenset[str]
+
+
+@dataclass(frozen=True)
+class SourceMemory:
+    source_id: str
+    source_kind: str
+    source_url: str | None
+    label: str
+    content: str
+    total_chars: int
+    chunks: tuple[SourceChunk, ...]
+    created_turn_index: int
+    created_at: float
 
 
 def build_chat_completions_url() -> str:
@@ -558,6 +640,238 @@ def format_extract_only_text(content: str, source_kind: str) -> str:
     return f"{label}\n\n{body or content.strip()}".strip()
 
 
+def infer_source_kind_from_context(content: str) -> str | None:
+    stripped = content.strip()
+    if not stripped:
+        return None
+    first_line = stripped.splitlines()[0].strip()
+    return CONTEXT_HEADER_SOURCE_KINDS.get(first_line)
+
+
+def extract_source_terms(text: str) -> frozenset[str]:
+    terms = {
+        token.casefold()
+        for token in SOURCE_QUERY_TOKEN_RE.findall(text)
+        if token.casefold() not in SOURCE_QUERY_STOPWORDS
+    }
+    return frozenset(terms)
+
+
+def build_source_chunks(content: str) -> tuple[SourceChunk, ...]:
+    stripped = content.strip()
+    if not stripped:
+        return ()
+
+    chunks: list[SourceChunk] = []
+    start = 0
+    text_length = len(stripped)
+    overlap = min(SOURCE_CHUNK_OVERLAP_CHARS, SOURCE_CHUNK_CHARS // 3)
+
+    while start < text_length:
+        end = min(start + SOURCE_CHUNK_CHARS, text_length)
+        chunk_text = stripped[start:end].strip()
+        if chunk_text:
+            chunks.append(
+                SourceChunk(
+                    index=len(chunks),
+                    text=chunk_text,
+                    start=start,
+                    end=end,
+                    terms=extract_source_terms(chunk_text),
+                )
+            )
+        if end >= text_length:
+            break
+        start = max(end - overlap, start + 1)
+
+    return tuple(chunks)
+
+
+def source_memory_id(source_kind: str, source_url: str | None, content: str) -> str:
+    source_key = source_url or content[:80].replace("\n", " ")
+    return f"{source_kind}:{source_key}:{len(content)}"
+
+
+def register_source_memory(
+    session_key: SessionKey,
+    content: str,
+    source_kind: str | None = None,
+    source_url: str | None = None,
+) -> SourceMemory | None:
+    stripped_content = content.strip()
+    resolved_source_kind = source_kind or infer_source_kind_from_context(content)
+    if resolved_source_kind not in SOURCE_CONTEXT_KINDS:
+        return None
+
+    chunks = build_source_chunks(stripped_content)
+    if not chunks:
+        return None
+
+    header_label, _ = strip_context_header(content)
+    memory = SourceMemory(
+        source_id=source_memory_id(resolved_source_kind, source_url, stripped_content),
+        source_kind=resolved_source_kind,
+        source_url=source_url,
+        label=header_label or SOURCE_EXTRACT_LABELS.get(resolved_source_kind, "참고 자료"),
+        content=stripped_content,
+        total_chars=len(stripped_content),
+        chunks=chunks,
+        created_turn_index=len(conversations.get(session_key, [])),
+        created_at=time.time(),
+    )
+
+    memories = [
+        existing
+        for existing in source_memories.get(session_key, [])
+        if existing.source_id != memory.source_id
+    ]
+    memories.append(memory)
+    source_memories[session_key] = memories[-SOURCE_MEMORY_LIMIT:]
+    return memory
+
+
+def latest_source_memory(session_key: SessionKey) -> SourceMemory | None:
+    memories = source_memories.get(session_key) or []
+    return memories[-1] if memories else None
+
+
+def is_broad_source_query(user_message: str, query_terms: frozenset[str]) -> bool:
+    stripped = user_message.strip()
+    if not stripped:
+        return True
+    if not query_terms:
+        return True
+    return bool(SOURCE_BROAD_QUERY_RE.search(stripped) and len(query_terms) <= 2)
+
+
+def representative_chunk_indices(chunk_count: int, max_chunks: int) -> list[int]:
+    if chunk_count <= 0:
+        return []
+    if chunk_count <= max_chunks:
+        return list(range(chunk_count))
+    if max_chunks <= 1:
+        return [0]
+
+    indices = {
+        round(position * (chunk_count - 1) / (max_chunks - 1))
+        for position in range(max_chunks)
+    }
+    return sorted(indices)
+
+
+def score_source_chunk(chunk: SourceChunk, query_terms: frozenset[str], normalized_query: str) -> float:
+    lowered = chunk.text.casefold()
+    score = 0.0
+    for term in query_terms:
+        count = lowered.count(term)
+        if count:
+            score += 2.0 + count
+        if term in chunk.terms:
+            score += 1.5
+    if normalized_query and len(normalized_query) >= 4 and normalized_query in lowered:
+        score += 5.0
+    if score > 0 and chunk.index == 0:
+        score += 0.25
+    return score
+
+
+def select_source_chunks(memory: SourceMemory, user_message: str) -> tuple[list[SourceChunk], str]:
+    chunks = list(memory.chunks)
+    if not chunks:
+        return [], "empty"
+
+    query_terms = extract_source_terms(user_message)
+    if is_broad_source_query(user_message, query_terms):
+        indices = representative_chunk_indices(len(chunks), SOURCE_RETRIEVAL_MAX_CHUNKS)
+        return [chunks[index] for index in indices], "representative"
+
+    normalized_query = " ".join(user_message.casefold().split())
+    scored = [
+        (score_source_chunk(chunk, query_terms, normalized_query), chunk)
+        for chunk in chunks
+    ]
+    positive_chunks = [(score, chunk) for score, chunk in scored if score > 0]
+    if not positive_chunks:
+        indices = representative_chunk_indices(len(chunks), SOURCE_RETRIEVAL_MAX_CHUNKS)
+        return [chunks[index] for index in indices], "representative"
+
+    selected: list[SourceChunk] = []
+    selected_indexes: set[int] = set()
+    selected_chars = 0
+    for score, chunk in sorted(positive_chunks, key=lambda item: (-item[0], item[1].index)):
+        if chunk.index in selected_indexes:
+            continue
+        projected_chars = selected_chars + len(chunk.text)
+        if selected and projected_chars > SOURCE_RETRIEVAL_CONTEXT_CHARS:
+            continue
+        selected.append(chunk)
+        selected_indexes.add(chunk.index)
+        selected_chars = projected_chars
+        if len(selected) >= SOURCE_RETRIEVAL_MAX_CHUNKS:
+            break
+
+    return sorted(selected, key=lambda chunk: chunk.index), "relevant"
+
+
+def build_retrieved_source_context(memory: SourceMemory, user_message: str) -> str:
+    if memory.total_chars <= SOURCE_DIRECT_CONTEXT_CHARS:
+        return memory.content
+
+    selected_chunks, mode = select_source_chunks(memory, user_message)
+    selected_numbers = ", ".join(str(chunk.index + 1) for chunk in selected_chunks) or "none"
+    source_label = SOURCE_KIND_LABELS.get(memory.source_kind, memory.label)
+    header_parts = [
+        "[Retrieved Source Context]",
+        f"Source: {source_label}",
+        f"Original source chars: {memory.total_chars}",
+        f"Chunks selected: {selected_numbers} / {len(memory.chunks)}",
+        f"Selection mode: {mode}",
+    ]
+    if memory.source_url:
+        header_parts.append(f"URL: {memory.source_url}")
+    header_parts.extend(
+        [
+            "",
+            "[Source Retrieval Rules]",
+            "- The full source is stored in session memory as chunks; only the selected chunks are shown here.",
+            "- Use the selected chunks as source evidence for the user's current question.",
+            "- If a requested detail is not supported by the selected chunks, say it is not visible in the retrieved chunks.",
+            "- For broad summaries, synthesize across the representative chunks without claiming exhaustive coverage of omitted chunks.",
+        ]
+    )
+
+    body_parts = []
+    for chunk in selected_chunks:
+        body_parts.append(
+            f"[Source Chunk {chunk.index + 1}/{len(memory.chunks)} chars {chunk.start}-{chunk.end}]\n"
+            f"{chunk.text}"
+        )
+
+    return "\n".join(header_parts + [""] + body_parts).strip()
+
+
+def resolve_source_context_for_request(
+    session_key: SessionKey,
+    user_message: str,
+    search_context: str,
+    source_kind: str | None = None,
+    source_url: str | None = None,
+) -> tuple[str, str | None, str | None, bool]:
+    if search_context:
+        memory = register_source_memory(session_key, search_context, source_kind, source_url)
+        if memory and memory.total_chars > SOURCE_DIRECT_CONTEXT_CHARS:
+            return build_retrieved_source_context(memory, user_message), memory.source_kind, memory.source_url, True
+        return search_context, source_kind, source_url, True
+
+    if not should_apply_source_followup_rules(session_key, user_message):
+        return "", source_kind, source_url, False
+
+    memory = latest_source_memory(session_key)
+    if not memory:
+        return "", source_kind, source_url, False
+    return build_retrieved_source_context(memory, user_message), memory.source_kind, memory.source_url, False
+
+
 def _ensure_url_scheme(url: str) -> str:
     if "://" in url:
         return url
@@ -661,6 +975,7 @@ def format_session_key(session_key: SessionKey) -> str:
 def clear_session_state(session_key: SessionKey) -> None:
     conversations.pop(session_key, None)
     session_histories.pop(session_key, None)
+    source_memories.pop(session_key, None)
     session_identifiers.pop(session_key, None)
     last_activity_at_by_session.pop(session_key, None)
 
@@ -751,7 +1066,11 @@ def save_session_to_vault(session_key: SessionKey) -> bool:
                 source_type = infer_source_type(context_part, source_kind)
                 user_block = f"**나** ({source_type} 첨부): {question_part}\n"
             else:
-                user_block = f"**나**: {content}\n"
+                if source_kind:
+                    source_type = infer_source_type("", source_kind)
+                    user_block = f"**나** ({source_type} 첨부): {content}\n"
+                else:
+                    user_block = f"**나**: {content}\n"
             if source_url:
                 user_block += f"<!-- source: {source_url} -->\n"
             session_md += f"{user_block}\n"
@@ -1001,6 +1320,25 @@ def response_validation_issue(text: str) -> str | None:
     return None
 
 
+def build_validation_safe_fallback(text: str) -> str | None:
+    normalized = normalize_response_text(text)
+    if not normalized:
+        return None
+
+    repaired = FORBIDDEN_RESPONSE_CJK_SPAN_RE.sub(CJK_OMISSION_PLACEHOLDER, normalized)
+    repaired = re.sub(
+        rf"(?:{re.escape(CJK_OMISSION_PLACEHOLDER)}\s*){{2,}}",
+        CJK_OMISSION_PLACEHOLDER,
+        repaired,
+    ).strip()
+    if response_validation_issue(repaired) is not None:
+        return None
+    return (
+        "응답 일부에 번역되지 않은 중국어/일본어 표기가 있어 해당 표기를 생략했습니다.\n\n"
+        f"{repaired}"
+    )
+
+
 def build_response_rewrite_messages(
     original_text: str,
     user_message: str,
@@ -1119,6 +1457,10 @@ async def validate_and_rewrite_response(
                 RESPONSE_REWRITE_MAX_ATTEMPTS,
                 exc,
             )
+            safe_fallback = build_validation_safe_fallback(candidate)
+            if safe_fallback:
+                logger.warning("Using CJK-omission fallback after translation exception.")
+                return safe_fallback
             return RESPONSE_VALIDATION_FAILURE_TEXT
 
         followup_issue = response_validation_issue(rewritten)
@@ -1134,6 +1476,11 @@ async def validate_and_rewrite_response(
         )
         candidate = rewritten
         issue = followup_issue
+
+    safe_fallback = build_validation_safe_fallback(candidate)
+    if safe_fallback:
+        logger.warning("Using CJK-omission fallback after max translation attempts.")
+        return safe_fallback
 
     return RESPONSE_VALIDATION_FAILURE_TEXT
 
@@ -1302,6 +1649,7 @@ async def extract_context_from_user_text(update: Update, user_id: int, user_text
 
 
 async def send_extract_only_reply(update: Update, session_key: SessionKey, extracted: ExtractedContext) -> None:
+    register_source_memory(session_key, extracted.content, extracted.source_kind, extracted.source_url)
     output_text = format_extract_only_text(extracted.content, extracted.source_kind)
     for chunk in chunk_text(output_text):
         await update.message.reply_text(chunk)
@@ -1388,6 +1736,12 @@ def trim_conversation_history(history: list[ChatMessage]) -> list[ChatMessage]:
 
 
 def has_recent_source_context(session_key: SessionKey, max_messages: int = 8) -> bool:
+    memory = latest_source_memory(session_key)
+    if memory:
+        history_len = len(conversations.get(session_key, []))
+        if history_len == 0 or history_len - memory.created_turn_index <= max_messages:
+            return True
+
     for message in reversed(conversations.get(session_key, [])[-max_messages:]):
         if message.get("role") == "user" and "[User Question]" in message.get("content", ""):
             return True
@@ -1448,6 +1802,7 @@ def prepare_messages(
     *,
     source_kind: str | None = None,
     source_url: str | None = None,
+    store_context_in_history: bool = True,
 ) -> list:
 
     if search_context:
@@ -1468,16 +1823,17 @@ def prepare_messages(
         augmented_message = user_message
     apply_source_followup = not search_context and should_apply_source_followup_rules(session_key, user_message)
     payload_message = build_source_followup_message(user_message) if apply_source_followup else augmented_message
+    history_message = augmented_message if store_context_in_history else user_message
 
     append_history_message(
         session_key,
         "user",
-        augmented_message,
+        history_message,
         source_kind=source_kind,
         source_url=source_url,
     )
     system_prompt = build_system_prompt(MODEL_NAME)
-    if apply_source_followup:
+    if apply_source_followup or not store_context_in_history:
         payload_history = conversations[session_key][:-1] + [{"role": "user", "content": payload_message}]
     else:
         payload_history = conversations[session_key]
@@ -1599,14 +1955,24 @@ async def stream_reply(
 
     touch_session_activity(session_key)
     ensure_session_identifier(session_key, update.message)
+    effective_search_context, effective_source_kind, effective_source_url, store_context_in_history = (
+        resolve_source_context_for_request(
+            session_key,
+            user_message,
+            search_context,
+            source_kind=source_kind,
+            source_url=source_url,
+        )
+    )
     messages = prepare_messages(
         session_key,
         user_message,
-        search_context,
-        source_kind=source_kind,
-        source_url=source_url,
+        effective_search_context,
+        source_kind=effective_source_kind,
+        source_url=effective_source_url,
+        store_context_in_history=store_context_in_history,
     )
-    request_payload = build_chat_completion_payload(messages, search_context)
+    request_payload = build_chat_completion_payload(messages, effective_search_context)
     reasoning_disabled = bool(request_payload.get("chat_template_kwargs", {}).get("enable_thinking") is False)
 
     bot_msg = None
@@ -1797,7 +2163,7 @@ async def stream_reply(
             final_text = normalize_response_text(full_text)
         else:
             final_text = "⚠️ 빈 응답"
-        final_text = await validate_and_rewrite_response(final_text, user_message, search_context)
+        final_text = await validate_and_rewrite_response(final_text, user_message, effective_search_context)
         reasoning_chars = max(reasoning_chars, len(extract_think_text(full_text)))
 
         try:
