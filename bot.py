@@ -1,0 +1,2094 @@
+import os
+import re
+import asyncio
+import json
+import logging
+import time
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse, urlunparse
+import requests
+from dotenv import load_dotenv
+from tavily import TavilyClient
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
+from tagger import generate_tags
+from prompt_profiles import render_prompt_profile
+from extractors import (
+    TWEET_URL_PATTERN,
+    YOUTUBE_URL_PATTERN,
+    GENERAL_URL_PATTERN,
+    extract_tweet_from_url,
+    extract_pdf_text,
+    extract_pdf_from_url,
+    extract_web_result,
+    extract_youtube_transcript,
+)
+
+ENV_FILES_LOADED: list[str] = []
+ChatMessage = dict[str, str]
+SessionKey = tuple[int, int, int]
+CAPTURE_SESSION_ID_MARKER_PREFIX = "<!-- capture:session-id="
+SOURCE_KIND_LABELS = {
+    "x": "X 포스트",
+    "youtube": "YouTube",
+    "pdf": "PDF",
+    "web": "웹 아티클",
+}
+
+
+def load_environment() -> list[str]:
+    """프로젝트 .env와 상위 공용 env 파일을 순서대로 로드한다.
+
+    상위 공용 파일은 프로젝트 .env보다 우선하도록 마지막에 override=True로 덮어쓴다.
+    """
+
+    root_dir = Path(__file__).resolve().parent
+    candidate_paths = [
+        root_dir / ".env",
+        root_dir.parent / "shared_ai.env",
+        root_dir.parent / ".shared_ai.env",
+        root_dir.parent / "shared-ai.env",
+        root_dir.parent / ".shared-ai.env",
+    ]
+
+    loaded_files: list[str] = []
+    for env_path in candidate_paths:
+        if env_path.exists():
+            load_dotenv(env_path, override=True)
+            loaded_files.append(str(env_path))
+
+    return loaded_files
+
+
+ENV_FILES_LOADED = load_environment()
+
+# ──────────────────────────────────────────────
+# 설정
+# ──────────────────────────────────────────────
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
+LLM_API_BASE_URL = (
+    os.getenv("OMLX_BASE_URL")
+    or os.getenv("LLM_API_BASE_URL")
+    or os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
+)
+LLM_API_KEY = os.getenv("OMLX_API_KEY") or os.getenv("LLM_API_KEY", "")
+LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER_NAME", "OMLX")
+ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "")
+MODEL_NAME = ((os.getenv("OMLX_MODEL") or os.getenv("MODEL_NAME")) or "").strip()
+VAULT_CAPTURE_PATH = (
+    os.getenv("VAULT_CAPTURE_PATH") or os.getenv("VAULT_HAIKU_PATH") or ""
+).strip()
+
+
+def parse_session_inactive_ttl_seconds(raw_value: str | None) -> tuple[int | None, str | None]:
+    if raw_value is None:
+        return 86400, None
+
+    stripped = raw_value.strip()
+    if not stripped:
+        return None, None
+
+    try:
+        ttl_seconds = int(stripped)
+    except ValueError:
+        return None, "SESSION_INACTIVE_TTL_SECONDS must be an integer number of seconds"
+
+    if ttl_seconds < 0:
+        return None, "SESSION_INACTIVE_TTL_SECONDS must be greater than or equal to 0"
+    if ttl_seconds == 0:
+        return None, None
+    return ttl_seconds, None
+
+
+SESSION_INACTIVE_TTL_SECONDS, SESSION_INACTIVE_TTL_CONFIG_ERROR = parse_session_inactive_ttl_seconds(
+    os.getenv("SESSION_INACTIVE_TTL_SECONDS") or os.getenv("SESSION_IDLE_TTL_SECONDS")
+)
+
+# Tavily 클라이언트
+tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
+
+# 대화 기록
+# conversations: LLM 컨텍스트에 보낼 최근 대화
+# session_histories: /c 저장용 전체 세션 누적 대화
+conversations: dict[SessionKey, list[ChatMessage]] = {}
+session_histories: dict[SessionKey, list[ChatMessage]] = {}
+session_identifiers: dict[SessionKey, str] = {}
+last_activity_at_by_session: dict[SessionKey, float] = {}
+MAX_HISTORY_PAIRS = 10
+
+
+def build_system_prompt(model_name: str, today: datetime | None = None) -> str:
+    current_date = (today or datetime.now()).strftime("%Y-%m-%d")
+    return render_prompt_profile(model_name, variables={"today": current_date})
+
+
+def validate_runtime_config() -> list[str]:
+    missing: list[str] = []
+    if not TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_TOKEN")
+    if not MODEL_NAME:
+        missing.append("OMLX_MODEL or MODEL_NAME")
+    if SESSION_INACTIVE_TTL_CONFIG_ERROR:
+        missing.append(SESSION_INACTIVE_TTL_CONFIG_ERROR)
+    return missing
+
+
+STREAM_EDIT_INTERVAL = 1.5  # 텔레그램 메시지 수정 간격 (초)
+DRAFT_STREAM_INTERVAL = 0.9
+DRAFT_STREAM_START_INTERVAL = 0.18
+DRAFT_STREAM_START_CHARS = 80
+DRAFT_STREAM_MIN_CHARS_DELTA = 40
+TYPING_ACTION_INTERVAL = 4.0
+TELEGRAM_TEXT_LIMIT = 4000
+DEFAULT_CONTEXT_PROMPT = "이 내용을 한국어로 간단히 요약해줘."
+RESPONSE_VALIDATION_FAILURE_TEXT = "⚠️ 응답이 한국어 출력 규칙을 통과하지 못했습니다. 다시 요청해 주세요."
+DRAFT_STREAM_FINAL_FLUSH_DELAY = 0.30
+MIN_REASONING_STATUS_CHARS = 2
+ENABLE_TELEGRAM_DRAFT_STREAMING = os.getenv("ENABLE_TELEGRAM_DRAFT_STREAMING", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DISABLE_THINKING_FOR_CONTEXT = os.getenv("DISABLE_THINKING_FOR_CONTEXT", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ENABLE_AUTO_SEARCH = os.getenv("ENABLE_AUTO_SEARCH", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ENABLE_RESPONSE_VALIDATION = os.getenv("ENABLE_RESPONSE_VALIDATION", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def parse_positive_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        parsed = float(raw_value.strip())
+    except ValueError:
+        logging.getLogger(__name__).warning("%s must be a positive number; using default %s", name, default)
+        return default
+
+    if parsed <= 0:
+        logging.getLogger(__name__).warning("%s must be greater than 0; using default %s", name, default)
+        return default
+    return parsed
+
+
+AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS = parse_positive_float_env(
+    "AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS",
+    12.0,
+)
+RESPONSE_REWRITE_TIMEOUT_SECONDS = parse_positive_float_env(
+    "RESPONSE_REWRITE_TIMEOUT_SECONDS",
+    45.0,
+)
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+file_handler = logging.FileHandler(Path(__file__).resolve().parent / "bot.log", encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+logging.getLogger().addHandler(file_handler)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+if ENV_FILES_LOADED:
+    logger.info("Loaded env files: %s", ", ".join(ENV_FILES_LOADED))
+else:
+    logger.warning("No env files were loaded.")
+
+
+REPLACEMENT_CHAR = "\ufffd"
+LATEX_COMMAND_REPLACEMENTS = {
+    r"\to": "→",
+    r"\rightarrow": "→",
+    r"\Rightarrow": "⇒",
+    r"\leftarrow": "←",
+    r"\Leftarrow": "⇐",
+    r"\leftrightarrow": "↔",
+    r"\Leftrightarrow": "⇔",
+    r"\mapsto": "↦",
+}
+GENERIC_TABLE_LABELS = {
+    "구분",
+    "분류",
+    "항목",
+    "기준",
+    "category",
+    "categories",
+    "item",
+    "items",
+    "label",
+    "labels",
+}
+FORBIDDEN_RESPONSE_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+EXTRACT_ONLY_SUFFIX_RE = re.compile(r"(?:^|\s)/(?:e|extract|raw)\s*$", re.IGNORECASE)
+CONTEXT_HEADER_LABELS = {
+    "[X Post]": "X 포스트 원문",
+    "[X Article]": "X 아티클 원문",
+    "[YouTube Transcript]": "YouTube 스크립트",
+    "[Web Article]": "웹페이지 본문",
+    "[PDF Document]": "PDF 텍스트",
+}
+SOURCE_EXTRACT_LABELS = {
+    "x": "X 포스트 원문",
+    "youtube": "YouTube 스크립트",
+    "pdf": "PDF 텍스트",
+    "web": "웹페이지 본문",
+}
+SOURCE_FOLLOWUP_SKIP_RE = re.compile(
+    r"(다른\s*얘기|다른\s*주제|방금\s*(거|것)\s*무시|컨텍스트\s*무시|원문\s*무시|"
+    r"ignore\s+(the\s+)?(previous|context|source)|new\s+topic)",
+    re.IGNORECASE,
+)
+EXPLICIT_RECENCY_SIGNAL_RE = re.compile(
+    r"("
+    r"오늘|어제|지금|현재|최신|최근|이번\s*(주|달|분기|해)|올해|내일|방금|"
+    r"출시|발표|공개|업데이트|실적|가이던스|주가|시가총액|소비자\s*반응|시장\s*반응|"
+    r"today|yesterday|tomorrow|now|current|currently|latest|recent|recently|"
+    r"released?|launched?|announced?|updated?|earnings|guidance|stock\s*price|market\s*cap|"
+    r"consumer\s*reaction|market\s*reaction"
+    r")",
+    re.IGNORECASE,
+)
+DYNAMIC_MARKET_SIGNAL_RE = re.compile(
+    r"(\$[A-Z]{1,6}\b|\b(CPI|FOMC|GDP|PCE|EPS|SEC|FDA)\b|금리|환율|인플레이션|실업률|실적발표)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class AutoSearchDecision:
+    needs_search: bool
+    query: str = ""
+    reason: str = ""
+    source: str = "none"
+
+
+@dataclass(frozen=True)
+class ExtractedContext:
+    user_message: str
+    content: str
+    source: str
+    source_kind: str
+    source_url: str | None = None
+
+
+@dataclass(frozen=True)
+class ContextExtractionResult:
+    matched: bool
+    extracted: ExtractedContext | None = None
+
+
+def build_chat_completions_url() -> str:
+    """OpenAI-compatible base URL에서 chat/completions endpoint 생성."""
+    return f"{LLM_API_BASE_URL.rstrip('/')}/chat/completions"
+
+
+def build_llm_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    return headers
+
+
+def should_force_auto_search(user_message: str) -> bool:
+    """Hard guardrail for clearly time-sensitive prompts.
+
+    The main router is the LLM classifier below. This only catches explicit
+    current-event and market-data wording where skipping search is predictably
+    worse than an unnecessary lookup.
+    """
+
+    stripped = user_message.strip()
+    if not stripped:
+        return False
+    return bool(EXPLICIT_RECENCY_SIGNAL_RE.search(stripped) or DYNAMIC_MARKET_SIGNAL_RE.search(stripped))
+
+
+def _format_classifier_history(session_key: SessionKey | None, max_messages: int = 6) -> str:
+    if session_key is None:
+        return "(none)"
+
+    history = conversations.get(session_key, [])[-max_messages:]
+    if not history:
+        return "(none)"
+
+    formatted_messages = []
+    for message in history:
+        role = message.get("role", "unknown")
+        content = message.get("content", "").replace("\n", " ").strip()
+        if len(content) > 500:
+            content = f"{content[:500]}..."
+        formatted_messages.append(f"{role}: {content}")
+    return "\n".join(formatted_messages)
+
+
+def build_recency_classifier_messages(user_message: str, session_key: SessionKey | None = None) -> list[dict[str, str]]:
+    today = datetime.now().strftime("%Y-%m-%d")
+    history_text = _format_classifier_history(session_key)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a routing classifier for a Telegram assistant. "
+                "Decide whether answering the user's latest message requires up-to-date external information. "
+                "Mark needs_search=true for events, availability, prices, market conditions, financials, regulations, "
+                "product releases, public or consumer reaction, company/person status, or any claim that may have changed. "
+                "If uncertain, mark needs_search=true. "
+                "Return only JSON with keys: needs_search, query, reason."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Today: {today}\n\n"
+                f"Recent conversation:\n{history_text}\n\n"
+                f"Latest user message:\n{user_message}\n\n"
+                "Return JSON only. The query should be a concise web search query in the user's language when useful."
+            ),
+        },
+    ]
+
+
+def extract_json_object(text: str) -> dict | None:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    fence_match = re.search(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        parsed = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def classify_recency_need(user_message: str, session_key: SessionKey | None = None) -> AutoSearchDecision:
+    payload = {
+        "model": MODEL_NAME,
+        "messages": build_recency_classifier_messages(user_message, session_key=session_key),
+        "stream": False,
+        "temperature": 0,
+        "max_tokens": 220,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    response = requests.post(
+        build_chat_completions_url(),
+        headers=build_llm_headers(),
+        json=payload,
+        timeout=AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return AutoSearchDecision(False, reason="classifier response missing message content", source="classifier")
+
+    parsed = extract_json_object(content)
+    if not parsed:
+        return AutoSearchDecision(False, reason="classifier response was not valid JSON", source="classifier")
+
+    needs_search = bool(parsed.get("needs_search"))
+    query = str(parsed.get("query") or "").strip()
+    reason = str(parsed.get("reason") or "").strip()
+    return AutoSearchDecision(
+        needs_search=needs_search,
+        query=query or user_message.strip(),
+        reason=reason,
+        source="classifier",
+    )
+
+
+def resolve_auto_search_decision(
+    user_message: str,
+    session_key: SessionKey | None = None,
+) -> AutoSearchDecision:
+    if not ENABLE_AUTO_SEARCH:
+        return AutoSearchDecision(False, reason="auto search disabled", source="disabled")
+    if tavily is None:
+        return AutoSearchDecision(False, reason="missing TAVILY_API_KEY", source="missing_tavily")
+    if should_force_auto_search(user_message):
+        return AutoSearchDecision(True, query=user_message.strip(), reason="explicit recency signal", source="guardrail")
+
+    try:
+        return classify_recency_need(user_message, session_key=session_key)
+    except Exception as exc:
+        logger.warning("Auto-search classifier failed: %s", exc)
+        return AutoSearchDecision(False, reason=str(exc), source="classifier_error")
+
+
+def build_capture_session_id(chat_id: int, message_id: int) -> str:
+    return f"tg:{chat_id}:{message_id}"
+
+
+def build_capture_session_marker(session_id: str) -> str:
+    return f"{CAPTURE_SESSION_ID_MARKER_PREFIX}{session_id} -->"
+
+
+def find_matching_url(text: str, pattern: re.Pattern[str]) -> str | None:
+    for match in GENERAL_URL_PATTERN.finditer(text):
+        candidate = match.group(0)
+        if pattern.search(candidate):
+            return candidate
+
+    pattern_match = pattern.search(text)
+    if not pattern_match:
+        return None
+    return pattern_match.group(0)
+
+
+def remove_url_once(text: str, url: str | None) -> str:
+    if not url:
+        return text.strip()
+    return re.sub(r"\s{2,}", " ", text.replace(url, "", 1)).strip()
+
+
+def parse_extract_only_request(text: str) -> tuple[str, bool]:
+    stripped = text.strip()
+    cleaned = EXTRACT_ONLY_SUFFIX_RE.sub("", stripped).strip()
+    return cleaned, cleaned != stripped
+
+
+def strip_context_header(content: str) -> tuple[str | None, str]:
+    stripped = content.strip()
+    if not stripped:
+        return None, ""
+
+    lines = stripped.splitlines()
+    first_line = lines[0].strip()
+    label = CONTEXT_HEADER_LABELS.get(first_line)
+    if not label:
+        return None, stripped
+    return label, "\n".join(lines[1:]).strip()
+
+
+def format_extract_only_text(content: str, source_kind: str) -> str:
+    header_label, body = strip_context_header(content)
+    label = header_label or SOURCE_EXTRACT_LABELS.get(source_kind, "추출 원문")
+    return f"{label}\n\n{body or content.strip()}".strip()
+
+
+def _ensure_url_scheme(url: str) -> str:
+    if "://" in url:
+        return url
+    return f"https://{url}"
+
+
+def _sanitize_source_url(parsed_url) -> str:
+    scheme = (parsed_url.scheme or "https").lower()
+    hostname = (parsed_url.hostname or "").lower()
+    if not hostname:
+        return ""
+
+    netloc = hostname
+    if parsed_url.port is not None:
+        netloc = f"{hostname}:{parsed_url.port}"
+
+    sanitized = parsed_url._replace(
+        scheme=scheme,
+        netloc=netloc,
+        params="",
+        query="",
+        fragment="",
+    )
+    return urlunparse(sanitized)
+
+
+def normalize_source_url(raw_url: str, source_kind: str) -> str | None:
+    stripped = raw_url.strip()
+    if not stripped:
+        return None
+
+    if source_kind == "youtube":
+        match = YOUTUBE_URL_PATTERN.search(stripped)
+        if not match:
+            return None
+        return f"https://www.youtube.com/watch?v={match.group(1)}"
+
+    if source_kind == "x":
+        match = TWEET_URL_PATTERN.search(stripped)
+        if not match:
+            return None
+        parsed = urlparse(_ensure_url_scheme(match.group(0)))
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 3 and path_parts[1] == "status":
+            username = path_parts[0]
+            tweet_id = path_parts[2]
+            return f"https://x.com/{username}/status/{tweet_id}"
+        return f"https://x.com/i/status/{match.group(1)}"
+
+    parsed = urlparse(_ensure_url_scheme(stripped))
+    normalized = _sanitize_source_url(parsed)
+    return normalized or None
+
+
+def infer_source_type(context_part: str, source_kind: str | None = None) -> str:
+    if source_kind:
+        label = SOURCE_KIND_LABELS.get(source_kind)
+        if label:
+            return label
+
+    if "[X Post]" in context_part or "[X Article]" in context_part:
+        return "X 포스트"
+    if "[YouTube Transcript]" in context_part:
+        return "YouTube"
+    if "[Web Article]" in context_part:
+        return "웹 아티클"
+    if "[Web Search Results]" in context_part:
+        return "웹 검색"
+    if "[PDF Document]" in context_part:
+        return "PDF"
+    return "참고 자료"
+
+
+def normalize_message_thread_id(message_thread_id: object) -> int:
+    if isinstance(message_thread_id, int):
+        return message_thread_id
+    return 0
+
+
+def build_session_key(user_id: int, message) -> SessionKey | None:
+    if message is None:
+        return None
+
+    chat_id = getattr(message, "chat_id", None)
+    if not isinstance(chat_id, int):
+        return None
+
+    message_thread_id = normalize_message_thread_id(getattr(message, "message_thread_id", None))
+    return (user_id, chat_id, message_thread_id)
+
+
+def get_session_history(session_key: SessionKey) -> list[ChatMessage]:
+    return session_histories.get(session_key) or conversations.get(session_key) or []
+
+
+def format_session_key(session_key: SessionKey) -> str:
+    user_id, chat_id, message_thread_id = session_key
+    return f"user={user_id} chat={chat_id} thread={message_thread_id}"
+
+
+def clear_session_state(session_key: SessionKey) -> None:
+    conversations.pop(session_key, None)
+    session_histories.pop(session_key, None)
+    session_identifiers.pop(session_key, None)
+    last_activity_at_by_session.pop(session_key, None)
+
+
+def touch_session_activity(session_key: SessionKey, now: float | None = None) -> None:
+    last_activity_at_by_session[session_key] = now if now is not None else time.time()
+
+
+def cleanup_inactive_sessions(now: float | None = None) -> list[SessionKey]:
+    if SESSION_INACTIVE_TTL_SECONDS is None:
+        return []
+
+    current_time = now if now is not None else time.time()
+    cleaned_up_keys: list[SessionKey] = []
+    for session_key, last_activity_at in list(last_activity_at_by_session.items()):
+        inactive_seconds = current_time - last_activity_at
+        if inactive_seconds < SESSION_INACTIVE_TTL_SECONDS:
+            continue
+
+        clear_session_state(session_key)
+        cleaned_up_keys.append(session_key)
+        logger.info(
+            "Cleaned up inactive session from memory: %s inactive_seconds=%s",
+            format_session_key(session_key),
+            int(inactive_seconds),
+        )
+
+    return cleaned_up_keys
+
+
+def ensure_session_identifier(session_key: SessionKey, message) -> str | None:
+    existing_identifier = session_identifiers.get(session_key)
+    if existing_identifier:
+        return existing_identifier
+
+    if message is None:
+        return None
+
+    chat_id = getattr(message, "chat_id", None)
+    message_id = getattr(message, "message_id", None)
+    if not isinstance(chat_id, int) or not isinstance(message_id, int):
+        return None
+
+    session_identifier = build_capture_session_id(chat_id, message_id)
+    session_identifiers[session_key] = session_identifier
+    return session_identifier
+
+
+# ──────────────────────────────────────────────
+# Vault 로그 저장
+# ──────────────────────────────────────────────
+def save_session_to_vault(session_key: SessionKey) -> bool:
+    """세션 종료 시 누적 세션 전체를 Vault/Capture에 MD로 저장"""
+    if not VAULT_CAPTURE_PATH:
+        return False
+
+    history = get_session_history(session_key)
+    if not history:
+        return False
+
+    logs_dir = Path(VAULT_CAPTURE_PATH).expanduser()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_file = logs_dir / f"{today}.md"
+
+    # 대화를 MD로 포맷
+    now = datetime.now().strftime("%H:%M")
+    session_identifier = session_identifiers.get(session_key)
+    session_md = f"\n\n---\n\n## AI 세션 ({now}, {MODEL_NAME})\n"
+    if session_identifier:
+        session_md += f"{build_capture_session_marker(session_identifier)}\n"
+    session_md += "\n"
+
+    for msg in history:
+        role = msg["role"]
+        content = msg["content"]
+        source_kind = msg.get("source_kind", "").strip() or None
+        source_url = msg.get("source_url", "").strip()
+
+        if role == "user":
+            # 검색 컨텍스트가 포함된 경우, [User Question] 이후만 표시
+            if "[User Question]" in content:
+                parts = content.split("[User Question]")
+                context_part = parts[0].strip()
+                question_part = parts[1].strip() if len(parts) > 1 else ""
+
+                source_type = infer_source_type(context_part, source_kind)
+                user_block = f"**나** ({source_type} 첨부): {question_part}\n"
+            else:
+                user_block = f"**나**: {content}\n"
+            if source_url:
+                user_block += f"<!-- source: {source_url} -->\n"
+            session_md += f"{user_block}\n"
+        elif role == "assistant":
+            session_md += f"**AI**: {content}\n\n"
+
+    # 태그 추가
+    tags = generate_tags(history)
+    session_md += f"{tags}\n"
+
+    # 파일이 있으면 추가, 없으면 헤더 포함 생성
+    if log_file.exists():
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(session_md)
+    else:
+        weekday = datetime.now().strftime("%A")
+        header = f"# {today} {weekday}\n"
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write(header + session_md)
+
+    logger.info(f"Session saved to vault: {log_file}")
+    return True
+
+
+# ──────────────────────────────────────────────
+# 접근 제어
+# ──────────────────────────────────────────────
+def is_allowed(user_id: int) -> bool:
+    if not ALLOWED_USER_IDS:
+        logger.warning("Access denied because ALLOWED_USER_IDS is not configured.")
+        return False
+    allowed = [int(uid.strip()) for uid in ALLOWED_USER_IDS.split(",") if uid.strip()]
+    return user_id in allowed
+
+
+# ──────────────────────────────────────────────
+# <think> 태그 제거
+# ──────────────────────────────────────────────
+def strip_think(text: str) -> str:
+    if "<think>" in text and "</think>" in text:
+        return text.split("</think>")[-1].strip()
+    return text
+
+
+def extract_think_text(text: str) -> str:
+    matches = re.findall(r"<think>(.*?)</think>", text, flags=re.DOTALL)
+    return "".join(matches).strip()
+
+
+def should_show_reasoning_status(reasoning_text: str) -> bool:
+    normalized = re.sub(r"[\W_]+", "", reasoning_text, flags=re.UNICODE)
+    return len(normalized) >= MIN_REASONING_STATUS_CHARS
+
+
+def strip_markdown(text: str) -> str:
+    """마크다운 서식을 평문으로 변환"""
+    # 코드 블록 (```...```) → 내용만 유지
+    text = re.sub(r"```\w*\n?", "", text)
+    # 인라인 코드 (`...`) → 내용만 유지
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # 볼드/이탤릭 (**, *, __, _)
+    text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", text)
+    text = re.sub(r"_{1,3}([^_]+)_{1,3}", r"\1", text)
+    # 헤더 (##)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # 리스트 마커 (-, *, 1.)는 유지 (가독성)
+    return text.strip()
+
+
+def contains_replacement_char(text: str) -> bool:
+    return REPLACEMENT_CHAR in text
+
+
+def sanitize_replacement_chars(text: str) -> str:
+    """깨진 유니코드 대체 문자는 사용자에게 보내기 전에 제거한다."""
+    if not text:
+        return text
+    return text.replace(REPLACEMENT_CHAR, "")
+
+
+def _normalize_table_cell(cell: str) -> str:
+    return re.sub(r"\s+", " ", cell).strip()
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if "|" not in stripped:
+        return []
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells = [_normalize_table_cell(cell) for cell in stripped.split("|")]
+    return cells if len(cells) >= 2 else []
+
+
+def _is_markdown_table_separator(line: str, expected_columns: int) -> bool:
+    cells = _split_markdown_table_row(line)
+    if len(cells) != expected_columns:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells)
+
+
+def _render_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+    normalized_headers = [_normalize_table_cell(header) for header in headers]
+    normalized_rows = [
+        [_normalize_table_cell(cell) for cell in row[: len(normalized_headers)]]
+        for row in rows
+    ]
+
+    if len(normalized_headers) >= 3:
+        column_labels = [
+            header or f"열 {index}"
+            for index, header in enumerate(normalized_headers[1:], start=1)
+        ]
+        title = " vs ".join(column_labels)
+        parts = [title] if title else []
+
+        for row in normalized_rows:
+            row_label = row[0] or normalized_headers[0] or "항목"
+            if parts:
+                parts.append("")
+            parts.append(row_label)
+            for column_label, value in zip(column_labels, row[1:]):
+                parts.append(f"- {column_label}: {value}")
+            if len(row) < len(normalized_headers):
+                for column_label in column_labels[len(row) - 1 :]:
+                    parts.append(f"- {column_label}: ")
+        return "\n".join(parts).strip()
+
+    if len(normalized_headers) == 2:
+        left_header, right_header = normalized_headers
+        left_is_generic = left_header.strip().lower() in GENERIC_TABLE_LABELS
+        if left_is_generic:
+            return "\n".join(f"- {row[0]}: {row[1]}" for row in normalized_rows).strip()
+
+        parts = [f"{left_header} / {right_header}"] if left_header or right_header else []
+        for row in normalized_rows:
+            if parts:
+                parts.append("")
+            parts.append(f"{row[0]}: {row[1]}")
+        return "\n".join(parts).strip()
+
+    return "\n".join(" | ".join(row) for row in normalized_rows).strip()
+
+
+def normalize_markdown_tables(text: str) -> str:
+    if not text or "|" not in text:
+        return text
+
+    lines = text.splitlines()
+    normalized_lines: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        header_cells = _split_markdown_table_row(lines[index])
+        if (
+            len(header_cells) >= 2
+            and index + 2 < len(lines)
+            and _is_markdown_table_separator(lines[index + 1], len(header_cells))
+        ):
+            row_index = index + 2
+            rows: list[list[str]] = []
+            while row_index < len(lines):
+                row_cells = _split_markdown_table_row(lines[row_index])
+                if len(row_cells) != len(header_cells):
+                    break
+                rows.append(row_cells)
+                row_index += 1
+
+            if rows:
+                normalized_lines.append(_render_markdown_table(header_cells, rows))
+                index = row_index
+                continue
+
+        normalized_lines.append(lines[index])
+        index += 1
+
+    return "\n".join(normalized_lines)
+
+
+def _normalize_latex_fragment(fragment: str) -> tuple[str, bool]:
+    normalized = fragment
+    changed = False
+    for latex, replacement in LATEX_COMMAND_REPLACEMENTS.items():
+        if latex in normalized:
+            normalized = normalized.replace(latex, replacement)
+            changed = True
+
+    if changed:
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    return normalized, changed
+
+
+def normalize_inline_latex(text: str) -> str:
+    """Telegram이 렌더링하지 못하는 흔한 LaTeX 화살표 표기를 평문 기호로 바꾼다."""
+    if not text:
+        return text
+
+    normalized = text
+    inline_patterns = (
+        re.compile(r"\$\$(.+?)\$\$", flags=re.DOTALL),
+        re.compile(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", flags=re.DOTALL),
+        re.compile(r"\\\((.+?)\\\)", flags=re.DOTALL),
+        re.compile(r"\\\[(.+?)\\\]", flags=re.DOTALL),
+    )
+
+    def replace_match(match: re.Match[str]) -> str:
+        fragment, changed = _normalize_latex_fragment(match.group(1))
+        if changed:
+            return fragment
+        return match.group(0)
+
+    for pattern in inline_patterns:
+        normalized = pattern.sub(replace_match, normalized)
+
+    for latex, replacement in LATEX_COMMAND_REPLACEMENTS.items():
+        normalized = re.sub(
+            rf"(?<![A-Za-z0-9_\\]){re.escape(latex)}(?![A-Za-z])",
+            replacement,
+            normalized,
+        )
+
+    return normalized
+
+
+def normalize_response_text(text: str) -> str:
+    if not text:
+        return text
+    return normalize_markdown_tables(
+        normalize_inline_latex(
+            sanitize_replacement_chars(
+                strip_markdown(
+                    strip_think(text)
+                )
+            )
+        )
+    ).strip()
+
+
+def response_validation_issue(text: str) -> str | None:
+    if not text.strip():
+        return "empty_response"
+    if FORBIDDEN_RESPONSE_CJK_RE.search(text):
+        return "contains_chinese_or_japanese_characters"
+    return None
+
+
+def build_response_rewrite_messages(
+    original_text: str,
+    user_message: str,
+    search_context: str,
+    issue: str,
+) -> list[dict[str, str]]:
+    context_note = "The previous answer was based on provided context/search results." if search_context else ""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You rewrite assistant responses so they comply with output rules. "
+                "Return only the corrected final answer. "
+                "Write in Korean only. Do not use Chinese or Japanese characters. "
+                "Do not add apologies or commentary about the rewrite."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Violation: {issue}\n"
+                f"{context_note}\n\n"
+                f"Original user request:\n{user_message}\n\n"
+                f"Previous answer:\n{original_text}\n\n"
+                "Rewrite the previous answer in Korean plain text only. "
+                "Translate any Chinese or Japanese text into Korean instead of copying it."
+            ).strip(),
+        },
+    ]
+
+
+def rewrite_invalid_response(
+    original_text: str,
+    user_message: str,
+    search_context: str,
+    issue: str,
+) -> str:
+    payload = {
+        "model": MODEL_NAME,
+        "messages": build_response_rewrite_messages(original_text, user_message, search_context, issue),
+        "stream": False,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    response = requests.post(
+        build_chat_completions_url(),
+        headers=build_llm_headers(),
+        json=payload,
+        timeout=RESPONSE_REWRITE_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    try:
+        rewritten = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return original_text
+
+    normalized = normalize_response_text(str(rewritten))
+    return normalized or original_text
+
+
+async def validate_and_rewrite_response(
+    text: str,
+    user_message: str,
+    search_context: str,
+) -> str:
+    if not ENABLE_RESPONSE_VALIDATION:
+        return text
+
+    issue = response_validation_issue(text)
+    if issue is None:
+        return text
+
+    try:
+        rewritten = await asyncio.to_thread(
+            rewrite_invalid_response,
+            text,
+            user_message,
+            search_context,
+            issue,
+        )
+    except Exception as exc:
+        logger.warning("Response rewrite failed after validation issue=%s: %s", issue, exc)
+        return RESPONSE_VALIDATION_FAILURE_TEXT
+
+    followup_issue = response_validation_issue(rewritten)
+    if followup_issue is not None:
+        logger.warning("Response rewrite still failed validation issue=%s", followup_issue)
+        return RESPONSE_VALIDATION_FAILURE_TEXT
+
+    logger.info("Response rewritten after validation issue=%s", issue)
+    return rewritten
+
+
+def build_draft_id() -> int:
+    """동일 응답 스트림 동안 재사용할 Telegram draft id를 만든다."""
+    draft_id = time.monotonic_ns() & 0x7FFFFFFF
+    return draft_id or 1
+
+
+def chunk_text(text: str, size: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    if not text:
+        return [""]
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def log_stage_metrics(
+    stage: str,
+    user_id: int,
+    elapsed_ms: int,
+    *,
+    ok: bool,
+    source: str | None = None,
+    detail: str | None = None,
+    chars: int | None = None,
+    method: str | None = None,
+):
+    logger.info(
+        "Stage metrics stage=%s user=%s source=%s method=%s ok=%s elapsed_ms=%s chars=%s detail=%s",
+        stage,
+        user_id,
+        source,
+        method,
+        ok,
+        elapsed_ms,
+        chars,
+        detail,
+    )
+
+
+async def extract_context_from_user_text(update: Update, user_id: int, user_text: str) -> ContextExtractionResult:
+    tweet_match = TWEET_URL_PATTERN.search(user_text)
+    if tweet_match:
+        tweet_url = find_matching_url(user_text, TWEET_URL_PATTERN) or tweet_match.group(0)
+        await update.message.reply_text("📰 X 피드 읽는 중...")
+        stage_started_at = asyncio.get_running_loop().time()
+        tweet_context = await asyncio.to_thread(extract_tweet_from_url, tweet_url)
+        log_stage_metrics(
+            "extract",
+            user_id,
+            int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+            ok=bool(tweet_context),
+            source="x",
+            detail=tweet_url,
+            chars=len(tweet_context) if tweet_context else 0,
+        )
+        if not tweet_context:
+            await update.message.reply_text("⚠️ 피드를 가져올 수 없습니다.")
+            return ContextExtractionResult(matched=True)
+
+        return ContextExtractionResult(
+            matched=True,
+            extracted=ExtractedContext(
+                user_message=remove_url_once(user_text, tweet_url),
+                content=tweet_context,
+                source="x",
+                source_kind="x",
+                source_url=normalize_source_url(tweet_url, "x"),
+            ),
+        )
+
+    yt_match = YOUTUBE_URL_PATTERN.search(user_text)
+    if yt_match:
+        video_id = yt_match.group(1)
+        youtube_url = find_matching_url(user_text, YOUTUBE_URL_PATTERN) or yt_match.group(0)
+        canonical_youtube_url = normalize_source_url(youtube_url, "youtube")
+        await update.message.reply_text("🎬 스크립트 추출 중...")
+        stage_started_at = asyncio.get_running_loop().time()
+        yt_context = await asyncio.to_thread(extract_youtube_transcript, video_id)
+        log_stage_metrics(
+            "extract",
+            user_id,
+            int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+            ok=bool(yt_context),
+            source="youtube",
+            detail=video_id,
+            chars=len(yt_context) if yt_context else 0,
+        )
+        if not yt_context:
+            await update.message.reply_text("⚠️ 스크립트를 가져올 수 없습니다. (스크립트가 없는 영상일 수 있어요)")
+            return ContextExtractionResult(matched=True)
+
+        return ContextExtractionResult(
+            matched=True,
+            extracted=ExtractedContext(
+                user_message=remove_url_once(user_text, youtube_url),
+                content=yt_context,
+                source="youtube",
+                source_kind="youtube",
+                source_url=canonical_youtube_url,
+            ),
+        )
+
+    url_match = GENERAL_URL_PATTERN.search(user_text)
+    if not url_match:
+        return ContextExtractionResult(matched=False)
+
+    url = url_match.group(0)
+    user_msg = remove_url_once(user_text, url)
+
+    if url.lower().endswith(".pdf"):
+        await update.message.reply_text("📄 PDF 다운로드 중...")
+        stage_started_at = asyncio.get_running_loop().time()
+        pdf_context = await asyncio.to_thread(extract_pdf_from_url, url)
+        log_stage_metrics(
+            "extract",
+            user_id,
+            int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+            ok=bool(pdf_context),
+            source="pdf_url",
+            detail=url,
+            chars=len(pdf_context) if pdf_context else 0,
+        )
+        if not pdf_context:
+            await update.message.reply_text("⚠️ PDF에서 텍스트를 추출할 수 없습니다.")
+            return ContextExtractionResult(matched=True)
+
+        return ContextExtractionResult(
+            matched=True,
+            extracted=ExtractedContext(
+                user_message=user_msg,
+                content=pdf_context,
+                source="pdf_url",
+                source_kind="pdf",
+                source_url=normalize_source_url(url, "pdf"),
+            ),
+        )
+
+    await update.message.reply_text("📖 웹페이지 읽는 중...")
+    stage_started_at = asyncio.get_running_loop().time()
+    web_result = await asyncio.to_thread(extract_web_result, url)
+    log_stage_metrics(
+        "extract",
+        user_id,
+        int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+        ok=bool(web_result),
+        source="web",
+        detail=web_result.document_url if web_result else url,
+        chars=len(web_result.content) if web_result else 0,
+        method=web_result.method if web_result else None,
+    )
+    if not web_result:
+        await update.message.reply_text("⚠️ 웹페이지에서 텍스트를 추출할 수 없습니다. (일부 JavaScript/iframe 기반 페이지는 여전히 지원되지 않을 수 있어요)")
+        return ContextExtractionResult(matched=True)
+
+    return ContextExtractionResult(
+        matched=True,
+        extracted=ExtractedContext(
+            user_message=user_msg,
+            content=web_result.content,
+            source="web",
+            source_kind="web",
+            source_url=normalize_source_url(web_result.document_url or url, "web"),
+        ),
+    )
+
+
+async def send_extract_only_reply(update: Update, session_key: SessionKey, extracted: ExtractedContext) -> None:
+    output_text = format_extract_only_text(extracted.content, extracted.source_kind)
+    for chunk in chunk_text(output_text):
+        await update.message.reply_text(chunk)
+
+    session_histories.setdefault(session_key, []).append(
+        {
+            "role": "user",
+            "content": "[Extracted Context]\n\n[User Question]\n원문 추출",
+            "source_kind": extracted.source_kind,
+            "source_url": extracted.source_url or "",
+        }
+    )
+    session_histories[session_key].append({"role": "assistant", "content": output_text})
+    touch_session_activity(session_key)
+
+
+async def send_message_draft(update: Update, draft_id: int, text: str) -> bool:
+    message = update.message
+    if not message or not text:
+        return False
+
+    bot = message.get_bot()
+    return await bot.send_message_draft(
+        chat_id=message.chat_id,
+        draft_id=draft_id,
+        text=text[:TELEGRAM_TEXT_LIMIT],
+        message_thread_id=message.message_thread_id,
+    )
+
+
+async def show_reasoning_status(
+    update: Update,
+    draft_id: int,
+    use_message_draft: bool,
+    bot_msg,
+    text: str = "🧠 추론 중...",
+):
+    if use_message_draft:
+        try:
+            await send_message_draft(update, draft_id, text)
+            return bot_msg, use_message_draft, True, True
+        except TelegramError as e:
+            logger.warning("sendMessageDraft failed while showing reasoning status, falling back to edit_text: %s", e)
+            use_message_draft = False
+
+    try:
+        if bot_msg is None:
+            bot_msg = await update.message.reply_text(text)
+        else:
+            await bot_msg.edit_text(text)
+        return bot_msg, use_message_draft, True, False
+    except Exception:
+        return bot_msg, use_message_draft, False, False
+
+
+async def keep_typing_until_visible(update: Update, stop_event: asyncio.Event):
+    message = update.message
+    if not message:
+        return
+
+    while not stop_event.is_set():
+        try:
+            await message.get_bot().send_chat_action(
+                chat_id=message.chat_id,
+                action=ChatAction.TYPING,
+                message_thread_id=message.message_thread_id,
+            )
+        except Exception:
+            return
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=TYPING_ACTION_INTERVAL)
+        except asyncio.TimeoutError:
+            continue
+
+
+def trim_conversation_history(history: list[ChatMessage]) -> list[ChatMessage]:
+    max_messages = MAX_HISTORY_PAIRS * 2
+    if history and history[-1]["role"] == "user":
+        max_messages += 1
+    if len(history) <= max_messages:
+        return history
+    return history[-max_messages:]
+
+
+def has_recent_source_context(session_key: SessionKey, max_messages: int = 8) -> bool:
+    for message in reversed(conversations.get(session_key, [])[-max_messages:]):
+        if message.get("role") == "user" and "[User Question]" in message.get("content", ""):
+            return True
+    return False
+
+
+def should_apply_source_followup_rules(session_key: SessionKey, user_message: str) -> bool:
+    stripped = user_message.strip()
+    if not stripped:
+        return False
+    if SOURCE_FOLLOWUP_SKIP_RE.search(stripped):
+        return False
+    if GENERAL_URL_PATTERN.search(stripped):
+        return False
+    return has_recent_source_context(session_key)
+
+
+def build_source_followup_message(user_message: str) -> str:
+    return (
+        "[Follow-up Source Rules]\n"
+        "- Treat the user's latest message as the priority lens for the previous source/context.\n"
+        "- Use the previously provided source/context as the evidence base.\n"
+        "- Do not use the previous assistant summary as the main frame; re-check the source/context for this lens.\n"
+        "- First identify evidence relevant to the user's latest lens, then answer or analyze.\n"
+        "- If the source/context does not support the requested lens, say so.\n"
+        "- Answer in Korean.\n\n"
+        f"[User Question]\n{user_message}"
+    )
+
+
+def append_history_message(
+    session_key: SessionKey,
+    role: str,
+    content: str,
+    *,
+    source_kind: str | None = None,
+    source_url: str | None = None,
+) -> list[ChatMessage]:
+    session_history = session_histories.setdefault(session_key, [])
+    session_message: ChatMessage = {"role": role, "content": content}
+    if source_kind:
+        session_message["source_kind"] = source_kind
+    if source_url:
+        session_message["source_url"] = source_url
+    session_history.append(session_message)
+
+    conversation_history = conversations.setdefault(session_key, [])
+    conversation_history.append({"role": role, "content": content})
+    conversations[session_key] = trim_conversation_history(conversation_history)
+    touch_session_activity(session_key)
+    return conversations[session_key]
+
+
+def prepare_messages(
+    session_key: SessionKey,
+    user_message: str,
+    search_context: str = "",
+    *,
+    source_kind: str | None = None,
+    source_url: str | None = None,
+) -> list:
+
+    if search_context:
+        augmented_message = (
+            f"{search_context}\n\n"
+            f"[Response Rules]\n"
+            f"- 반드시 한국어로만 답하세요.\n"
+            f"- 원문 언어가 영어, 중국어, 일본어 또는 다른 언어여도 한국어로 번역, 요약, 설명하세요.\n"
+            f"- 사용자가 명시적으로 원문 인용을 요청한 경우가 아니라면 중국어/일본어 문자를 출력하지 마세요.\n"
+            f"- 사용자가 영어 답변을 명시적으로 요청한 경우에만 영어로 답하세요.\n"
+            f"- Treat the provided context/search results as authoritative for current facts.\n"
+            f"- If the provided context conflicts with your internal memory, prefer the provided context.\n"
+            f"- Do not assert current facts that are not supported by the provided context; say they are unverified.\n"
+            f"- For current-event, product, company, market, or investment answers, separate verified facts from analysis and unresolved uncertainties.\n\n"
+            f"[User Question]\n{user_message}"
+        )
+    else:
+        augmented_message = user_message
+    apply_source_followup = not search_context and should_apply_source_followup_rules(session_key, user_message)
+    payload_message = build_source_followup_message(user_message) if apply_source_followup else augmented_message
+
+    append_history_message(
+        session_key,
+        "user",
+        augmented_message,
+        source_kind=source_kind,
+        source_url=source_url,
+    )
+    system_prompt = build_system_prompt(MODEL_NAME)
+    if apply_source_followup:
+        payload_history = conversations[session_key][:-1] + [{"role": "user", "content": payload_message}]
+    else:
+        payload_history = conversations[session_key]
+    return [{"role": "system", "content": system_prompt}] + payload_history
+
+
+def build_context_prompt(user_message: str) -> str:
+    stripped = user_message.strip()
+    return stripped or DEFAULT_CONTEXT_PROMPT
+
+
+def build_chat_completion_payload(messages: list[dict], search_context: str = "") -> dict:
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if search_context and DISABLE_THINKING_FOR_CONTEXT:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    return payload
+
+
+def extract_reasoning_tokens(usage: dict | None) -> int | None:
+    if not usage:
+        return None
+    reasoning_tokens = usage.get("reasoning_tokens")
+    if isinstance(reasoning_tokens, int):
+        return reasoning_tokens
+    completion_details = usage.get("completion_tokens_details")
+    if isinstance(completion_details, dict):
+        nested_reasoning_tokens = completion_details.get("reasoning_tokens")
+        if isinstance(nested_reasoning_tokens, int):
+            return nested_reasoning_tokens
+    return None
+
+
+def _stream_llm_response(payload: dict, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
+    try:
+        with requests.post(
+            build_chat_completions_url(),
+            headers=build_llm_headers(),
+            json=payload,
+            stream=True,
+            timeout=120,
+        ) as response:
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not line:
+                    continue
+
+                line_str = line.decode("utf-8")
+                if not line_str.startswith("data: "):
+                    continue
+
+                data_str = line_str[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(data_str)
+                    delta = chunk["choices"][0].get("delta", {})
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+
+                reasoning_token = delta.get("reasoning_content") or delta.get("reasoning", "")
+                content_token = delta.get("content", "")
+                usage = chunk.get("usage")
+
+                if reasoning_token:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("reasoning", reasoning_token))
+                if content_token:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("token", content_token))
+                if usage:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("usage", usage))
+
+        loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+    except Exception as e:
+        loop.call_soon_threadsafe(queue.put_nowait, ("error", e))
+
+
+async def stream_context_reply(
+    update: Update,
+    user_id: int,
+    user_message: str,
+    search_context: str,
+    source: str = "context",
+    source_kind: str | None = None,
+    source_url: str | None = None,
+):
+    await stream_reply(
+        update,
+        user_id,
+        build_context_prompt(user_message),
+        search_context,
+        source=source,
+        source_kind=source_kind,
+        source_url=source_url,
+    )
+
+
+# ──────────────────────────────────────────────
+# 스트리밍 LLM 호출 + 텔레그램 메시지 수정
+# ──────────────────────────────────────────────
+async def stream_reply(
+    update: Update,
+    user_id: int,
+    user_message: str,
+    search_context: str = "",
+    source: str = "chat",
+    source_kind: str | None = None,
+    source_url: str | None = None,
+):
+    cleanup_inactive_sessions()
+    session_key = build_session_key(user_id, update.message)
+    if session_key is None:
+        raise ValueError("Session key could not be determined from the incoming Telegram message.")
+
+    touch_session_activity(session_key)
+    ensure_session_identifier(session_key, update.message)
+    messages = prepare_messages(
+        session_key,
+        user_message,
+        search_context,
+        source_kind=source_kind,
+        source_url=source_url,
+    )
+    request_payload = build_chat_completion_payload(messages, search_context)
+    reasoning_disabled = bool(request_payload.get("chat_template_kwargs", {}).get("enable_thinking") is False)
+
+    bot_msg = None
+    full_text = ""
+    display_text = ""
+    last_edit_time = 0
+    last_streamed_text = ""
+    last_streamed_length = 0
+    inside_think = False
+    reasoning_status_shown = False
+    use_message_draft = ENABLE_TELEGRAM_DRAFT_STREAMING
+    draft_visible = False
+    draft_id = build_draft_id()
+    loop = asyncio.get_running_loop()
+    stream_started_at = loop.time()
+    first_token_at: float | None = None
+    first_reasoning_at: float | None = None
+    first_content_at: float | None = None
+    first_visible_at: float | None = None
+    stream_update_count = 0
+    reasoning_chars = 0
+    reasoning_used = False
+    reasoning_preview = ""
+    usage_data: dict | None = None
+    typing_stop_event = asyncio.Event()
+    queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+    worker = asyncio.create_task(asyncio.to_thread(_stream_llm_response, request_payload, loop, queue))
+    typing_task = asyncio.create_task(keep_typing_until_visible(update, typing_stop_event))
+
+    try:
+        while True:
+            event, payload = await queue.get()
+            if event == "done":
+                break
+            if event == "error":
+                raise payload
+            if event == "usage":
+                if isinstance(payload, dict):
+                    usage_data = payload
+                continue
+
+            if event == "reasoning":
+                token = payload
+                if not token:
+                    continue
+
+                if first_token_at is None:
+                    first_token_at = loop.time()
+                if first_reasoning_at is None:
+                    first_reasoning_at = loop.time()
+
+                reasoning_used = True
+                reasoning_preview += token
+                reasoning_chars += len(token)
+
+                if not reasoning_status_shown and should_show_reasoning_status(reasoning_preview):
+                    bot_msg, use_message_draft, shown, used_draft = await show_reasoning_status(
+                        update,
+                        draft_id,
+                        use_message_draft,
+                        bot_msg,
+                    )
+                    draft_visible = draft_visible or used_draft
+                    if shown:
+                        reasoning_status_shown = True
+                        if first_visible_at is None:
+                            first_visible_at = loop.time()
+                        stream_update_count += 1
+                continue
+
+            token = payload
+            if not token:
+                continue
+
+            if first_token_at is None:
+                first_token_at = loop.time()
+            if first_content_at is None:
+                first_content_at = loop.time()
+
+            full_text += token
+
+            # <think> 블록 감지 및 스킵
+            if "<think>" in full_text and "</think>" not in full_text:
+                inside_think = True
+                reasoning_used = True
+                reasoning_preview = full_text.split("<think>", 1)[-1]
+                if not reasoning_status_shown and should_show_reasoning_status(reasoning_preview):
+                    bot_msg, use_message_draft, shown, used_draft = await show_reasoning_status(
+                        update,
+                        draft_id,
+                        use_message_draft,
+                        bot_msg,
+                    )
+                    draft_visible = draft_visible or used_draft
+                    if shown:
+                        reasoning_status_shown = True
+                        if first_visible_at is None:
+                            first_visible_at = loop.time()
+                        stream_update_count += 1
+                continue
+            if inside_think and "</think>" in full_text:
+                inside_think = False
+                reasoning_chars = max(reasoning_chars, len(extract_think_text(full_text)))
+                display_text = full_text.split("</think>")[-1].strip()
+                continue
+            if inside_think:
+                continue
+
+            display_text = normalize_response_text(full_text)
+
+            if not display_text:
+                continue
+
+            # draft 또는 edit 기반 표시를 일정 간격으로 갱신한다.
+            now = loop.time()
+            streamed_text = display_text[:TELEGRAM_TEXT_LIMIT]
+            if ENABLE_RESPONSE_VALIDATION and response_validation_issue(streamed_text):
+                continue
+            if streamed_text == last_streamed_text:
+                continue
+            if (
+                use_message_draft
+                and last_streamed_length > 0
+                and len(streamed_text) - last_streamed_length < DRAFT_STREAM_MIN_CHARS_DELTA
+            ):
+                continue
+
+            if use_message_draft and len(streamed_text) < DRAFT_STREAM_START_CHARS:
+                interval = DRAFT_STREAM_START_INTERVAL
+            else:
+                interval = DRAFT_STREAM_INTERVAL if use_message_draft else STREAM_EDIT_INTERVAL
+            if now - last_edit_time >= interval:
+                if use_message_draft:
+                    try:
+                        await send_message_draft(update, draft_id, streamed_text)
+                        draft_visible = True
+                        if first_visible_at is None:
+                            first_visible_at = loop.time()
+                        last_edit_time = now
+                        last_streamed_text = streamed_text
+                        last_streamed_length = len(streamed_text)
+                        stream_update_count += 1
+                    except TelegramError as e:
+                        if draft_visible:
+                            logger.warning(
+                                "sendMessageDraft failed after draft became visible; skipping this draft update to avoid mixed-mode duplicates: %s",
+                                e,
+                            )
+                            last_edit_time = now
+                            continue
+                        logger.warning("sendMessageDraft failed, falling back to edit_text: %s", e)
+                        use_message_draft = False
+                        bot_msg = await update.message.reply_text(streamed_text)
+                        if first_visible_at is None:
+                            first_visible_at = loop.time()
+                        last_edit_time = now
+                        last_streamed_text = streamed_text
+                        last_streamed_length = len(streamed_text)
+                        stream_update_count += 1
+                else:
+                    try:
+                        if bot_msg is None:
+                            bot_msg = await update.message.reply_text(streamed_text)
+                        else:
+                            await bot_msg.edit_text(streamed_text)
+                        if first_visible_at is None:
+                            first_visible_at = loop.time()
+                        last_edit_time = now
+                        last_streamed_text = streamed_text
+                        last_streamed_length = len(streamed_text)
+                        stream_update_count += 1
+                    except Exception:
+                        pass  # rate limit 등 무시
+
+        # 최종 메시지 업데이트
+        if full_text:
+            final_text = normalize_response_text(full_text)
+        else:
+            final_text = "⚠️ 빈 응답"
+        final_text = await validate_and_rewrite_response(final_text, user_message, search_context)
+        reasoning_chars = max(reasoning_chars, len(extract_think_text(full_text)))
+
+        try:
+            final_chunks = chunk_text(final_text)
+            if use_message_draft:
+                final_draft_text = final_chunks[0][:TELEGRAM_TEXT_LIMIT]
+                if final_draft_text and final_draft_text != last_streamed_text:
+                    try:
+                        await send_message_draft(update, draft_id, final_draft_text)
+                        draft_visible = True
+                        last_streamed_text = final_draft_text
+                        last_streamed_length = len(final_draft_text)
+                        stream_update_count += 1
+                        if first_visible_at is None:
+                            first_visible_at = loop.time()
+                        await asyncio.sleep(DRAFT_STREAM_FINAL_FLUSH_DELAY)
+                    except TelegramError as e:
+                        if draft_visible:
+                            logger.warning(
+                                "final sendMessageDraft flush failed after draft became visible; sending final message without switching modes: %s",
+                                e,
+                            )
+                        else:
+                            logger.warning("final sendMessageDraft flush failed, falling back to final message only: %s", e)
+                            use_message_draft = False
+
+            if use_message_draft:
+                for chunk in final_chunks:
+                    await update.message.reply_text(chunk)
+            else:
+                if bot_msg is None:
+                    bot_msg = await update.message.reply_text(final_chunks[0])
+                    for chunk in final_chunks[1:]:
+                        await update.message.reply_text(chunk)
+                elif len(final_text) > TELEGRAM_TEXT_LIMIT:
+                    await bot_msg.edit_text(final_chunks[0])
+                    for chunk in final_chunks[1:]:
+                        await update.message.reply_text(chunk)
+                else:
+                    await bot_msg.edit_text(final_text)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise
+
+        append_history_message(session_key, "assistant", final_text)
+        total_elapsed_ms = int((loop.time() - stream_started_at) * 1000)
+        first_token_ms = int((first_token_at - stream_started_at) * 1000) if first_token_at else None
+        first_reasoning_ms = int((first_reasoning_at - stream_started_at) * 1000) if first_reasoning_at else None
+        first_content_ms = int((first_content_at - stream_started_at) * 1000) if first_content_at else None
+        first_visible_ms = int((first_visible_at - stream_started_at) * 1000) if first_visible_at else None
+        reasoning_tokens = extract_reasoning_tokens(usage_data)
+        logger.info(
+            "Stream metrics user=%s source=%s mode=%s reasoning_disabled=%s reasoning_used=%s reasoning_chars=%s reasoning_tokens=%s first_token_ms=%s first_reasoning_ms=%s first_content_ms=%s first_visible_ms=%s total_ms=%s updates=%s chars=%s",
+            user_id,
+            source,
+            "draft" if use_message_draft else "edit",
+            reasoning_disabled,
+            reasoning_used,
+            reasoning_chars,
+            reasoning_tokens,
+            first_token_ms,
+            first_reasoning_ms,
+            first_content_ms,
+            first_visible_ms,
+            total_elapsed_ms,
+            stream_update_count,
+            len(final_text),
+        )
+
+    except Exception as e:
+        logger.error(f"LLM error: {e}")
+        error_text = f"⚠️ {LLM_PROVIDER_NAME} 연결 실패: {e}"
+        typing_stop_event.set()
+        if bot_msg is not None:
+            await bot_msg.edit_text(error_text)
+        else:
+            await update.message.reply_text(error_text)
+    finally:
+        typing_stop_event.set()
+        with suppress(Exception):
+            await worker
+        with suppress(Exception):
+            await typing_task
+
+
+
+# ──────────────────────────────────────────────
+# Tavily 검색
+# ──────────────────────────────────────────────
+def search_web(query: str) -> str:
+    if tavily is None:
+        logger.error("Search error: missing TAVILY_API_KEY")
+        return "Search failed: missing TAVILY_API_KEY"
+
+    try:
+        results = tavily.search(
+            query=query,
+            max_results=5,
+            search_depth="advanced",
+            include_answer=True,
+        )
+
+        output_parts = ["[Web Search Results]"]
+
+        if results.get("answer"):
+            output_parts.append(f"Summary: {results['answer']}")
+
+        for i, r in enumerate(results.get("results", []), 1):
+            output_parts.append(
+                f"\n[{i}] {r['title']}\n{r['content'][:300]}\nURL: {r['url']}"
+            )
+
+        return "\n".join(output_parts) if output_parts else "No results found."
+
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return f"Search failed: {e}"
+
+
+# ──────────────────────────────────────────────
+# 핸들러
+# ──────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vault_status = "✅ 연결됨" if VAULT_CAPTURE_PATH else "❌ 미설정"
+    access_status = "✅ 제한됨" if ALLOWED_USER_IDS else "⚠️ 미설정"
+    await update.message.reply_text(
+        "🤖 LLM 봇 준비 완료!\n\n"
+        "💬 일반 메시지 → LLM 대화\n"
+        "🔍 /s 질문 → 웹 검색 + LLM 답변\n"
+        "📎 /e URL → LLM 없이 원문 추출\n"
+        "🗑️ /c → 대화 기록 초기화 + Vault 저장\n"
+        "ℹ️ /m → 현재 모델 확인\n\n"
+        f"📂 Vault: {vault_status}\n"
+        f"🔐 접근 제어: {access_status}"
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ 접근 권한이 없습니다.")
+        return
+
+    cleanup_inactive_sessions()
+    current_session_key = build_session_key(user_id, update.message)
+    if current_session_key is not None:
+        touch_session_activity(current_session_key)
+
+    user_text = update.message.text
+    if not user_text:
+        return
+
+    routed_text, extract_only_requested = parse_extract_only_request(user_text)
+    extraction_result = await extract_context_from_user_text(update, user_id, routed_text)
+    if extraction_result.matched:
+        extracted = extraction_result.extracted
+        if extracted is None:
+            return
+        if extract_only_requested:
+            if current_session_key is not None:
+                ensure_session_identifier(current_session_key, update.message)
+                await send_extract_only_reply(update, current_session_key, extracted)
+            else:
+                for chunk in chunk_text(format_extract_only_text(extracted.content, extracted.source_kind)):
+                    await update.message.reply_text(chunk)
+            return
+
+        await stream_context_reply(
+            update,
+            user_id,
+            extracted.user_message,
+            extracted.content,
+            source=extracted.source,
+            source_kind=extracted.source_kind,
+            source_url=extracted.source_url,
+        )
+        return
+
+    if extract_only_requested:
+        await update.message.reply_text("사용법: /e URL 또는 URL /e")
+        return
+
+    # 메시지 끝에 /s가 있으면 검색 모드
+    if user_text.rstrip().endswith("/s"):
+        query = user_text.rstrip()[:-2].strip()
+        if query:
+            await update.message.reply_text("🔍 검색 중...")
+            stage_started_at = asyncio.get_running_loop().time()
+            search_results = await asyncio.to_thread(search_web, query)
+            log_stage_metrics(
+                "search",
+                user_id,
+                int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+                ok=bool(search_results),
+                source="search_suffix",
+                detail=query,
+                chars=len(search_results) if search_results else 0,
+            )
+            await stream_reply(update, user_id, query, search_results, source="search_suffix")
+            return
+
+    stage_started_at = asyncio.get_running_loop().time()
+    auto_search_decision = await asyncio.to_thread(
+        resolve_auto_search_decision,
+        user_text,
+        current_session_key,
+    )
+    log_stage_metrics(
+        "auto_search",
+        user_id,
+        int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+        ok=auto_search_decision.needs_search,
+        source=auto_search_decision.source,
+        detail=auto_search_decision.query or auto_search_decision.reason,
+    )
+    if auto_search_decision.needs_search:
+        await update.message.reply_text("🔍 최신 정보 확인 중...")
+        search_started_at = asyncio.get_running_loop().time()
+        search_results = await asyncio.to_thread(search_web, auto_search_decision.query or user_text)
+        log_stage_metrics(
+            "search",
+            user_id,
+            int((asyncio.get_running_loop().time() - search_started_at) * 1000),
+            ok=bool(search_results),
+            source="auto_search",
+            detail=auto_search_decision.query or user_text,
+            chars=len(search_results) if search_results else 0,
+        )
+        await stream_reply(update, user_id, user_text, search_results, source="auto_search")
+        return
+
+    await stream_reply(update, user_id, user_text, source="chat")
+
+
+async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ 접근 권한이 없습니다.")
+        return
+
+    cleanup_inactive_sessions()
+    current_session_key = build_session_key(user_id, update.message)
+    if current_session_key is not None:
+        touch_session_activity(current_session_key)
+
+    query = " ".join(context.args) if context.args else ""
+    if not query:
+        await update.message.reply_text("사용법: /s 검색할 내용")
+        return
+
+    await update.message.reply_text("🔍 검색 중...")
+    stage_started_at = asyncio.get_running_loop().time()
+    search_results = await asyncio.to_thread(search_web, query)
+    log_stage_metrics(
+        "search",
+        user_id,
+        int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+        ok=bool(search_results),
+        source="search_command",
+        detail=query,
+        chars=len(search_results) if search_results else 0,
+    )
+    await stream_reply(update, user_id, query, search_results, source="search_command")
+
+
+async def handle_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ 접근 권한이 없습니다.")
+        return
+
+    cleanup_inactive_sessions()
+    current_session_key = build_session_key(user_id, update.message)
+    if current_session_key is not None:
+        touch_session_activity(current_session_key)
+        ensure_session_identifier(current_session_key, update.message)
+
+    query = " ".join(context.args) if context and context.args else ""
+    query, _ = parse_extract_only_request(query)
+    if not query:
+        await update.message.reply_text("사용법: /e URL 또는 URL /e")
+        return
+
+    extraction_result = await extract_context_from_user_text(update, user_id, query)
+    if not extraction_result.matched:
+        await update.message.reply_text("사용법: /e URL 또는 URL /e")
+        return
+    if extraction_result.extracted is None:
+        return
+
+    if current_session_key is not None:
+        await send_extract_only_reply(update, current_session_key, extraction_result.extracted)
+    else:
+        output_text = format_extract_only_text(
+            extraction_result.extracted.content,
+            extraction_result.extracted.source_kind,
+        )
+        for chunk in chunk_text(output_text):
+            await update.message.reply_text(chunk)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ 접근 권한이 없습니다.")
+        return
+
+    cleanup_inactive_sessions()
+    current_session_key = build_session_key(user_id, update.message)
+    if current_session_key is not None:
+        touch_session_activity(current_session_key)
+
+    doc = update.message.document
+    if doc.mime_type != "application/pdf":
+        return
+
+    await update.message.reply_text("📄 PDF 읽는 중...")
+    file = await doc.get_file()
+    file_bytes = await file.download_as_bytearray()
+    stage_started_at = asyncio.get_running_loop().time()
+    pdf_context = await asyncio.to_thread(extract_pdf_text, bytes(file_bytes))
+    log_stage_metrics(
+        "extract",
+        user_id,
+        int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+        ok=bool(pdf_context),
+        source="pdf_upload",
+        detail=doc.mime_type,
+        chars=len(pdf_context) if pdf_context else 0,
+    )
+
+    if not pdf_context:
+        await update.message.reply_text("⚠️ PDF에서 텍스트를 추출할 수 없습니다.")
+        return
+
+    caption = update.message.caption or ""
+    caption_text, extract_only_requested = parse_extract_only_request(caption)
+    if extract_only_requested:
+        if current_session_key is not None:
+            ensure_session_identifier(current_session_key, update.message)
+            await send_extract_only_reply(
+                update,
+                current_session_key,
+                ExtractedContext(
+                    user_message=caption_text,
+                    content=pdf_context,
+                    source="pdf_upload",
+                    source_kind="pdf",
+                ),
+            )
+        else:
+            for chunk in chunk_text(format_extract_only_text(pdf_context, "pdf")):
+                await update.message.reply_text(chunk)
+        return
+
+    await stream_context_reply(update, user_id, caption, pdf_context, source="pdf_upload")
+
+
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    session_key = build_session_key(user_id, update.message)
+    if session_key is not None:
+        save_session_to_vault(session_key)
+        clear_session_state(session_key)
+    cleanup_inactive_sessions()
+    await update.message.reply_text("🗑️ 대화 기록 초기화 완료.")
+
+
+async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    env_hint = Path(ENV_FILES_LOADED[-1]).name if ENV_FILES_LOADED else "process env"
+    model_name = MODEL_NAME or "(unset)"
+    await update.message.reply_text(f"📦 현재 모델: {model_name}\n🔧 설정 소스: {env_hint}")
+
+
+# ──────────────────────────────────────────────
+# 메인
+# ──────────────────────────────────────────────
+def main():
+    missing_config = validate_runtime_config()
+    if missing_config:
+        raise RuntimeError(f"Missing required configuration: {', '.join(missing_config)}")
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("s", handle_search))
+    app.add_handler(CommandHandler("search", handle_search))
+    app.add_handler(CommandHandler("e", handle_extract))
+    app.add_handler(CommandHandler("extract", handle_extract))
+    app.add_handler(CommandHandler("raw", handle_extract))
+    app.add_handler(CommandHandler("c", clear_history))
+    app.add_handler(CommandHandler("m", show_model))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("Bot started!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

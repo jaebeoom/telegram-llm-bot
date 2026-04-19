@@ -1,0 +1,1 @@
+"""Prompt profile package resources."""

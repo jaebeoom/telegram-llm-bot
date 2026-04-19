@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-llm-bot"
+version = "0.1.0"
+description = "Telegram bot with OMLX-compatible local LLM + Tavily search"
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot[job-queue]>=21.0",
+    "requests>=2.31",
+    "chardet<6",
+    "tavily-python>=0.3",
+    "python-dotenv>=1.0",
+    "pymupdf>=1.24",
+    "youtube-transcript-api>=1.0.0",
+    "trafilatura>=1.6",
+    "playwright>=1.52",
+    "readability-lxml>=0.8.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"telegram_llm_bot.prompts" = ["*.md"]
+"telegram_llm_bot.prompts.models" = ["*.md"]

@@ -1,0 +1,13 @@
+.env
+.venv/
+.DS_Store
+.idea/
+.claude/
+AGENTS.md
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+build/
+bot.log
+img
