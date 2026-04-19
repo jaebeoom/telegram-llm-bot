@@ -18,11 +18,13 @@ from .extractors_common import (
     _is_x_url,
 )
 from .extractors_content import (
+    YouTubeTranscriptExtractionResult,
     extract_pdf_from_url,
     extract_pdf_text,
     extract_tweet,
     extract_tweet_from_url,
     extract_youtube_transcript,
+    extract_youtube_transcript_result,
 )
 from .extractors_network import _download_public_url, _is_private_hostname, _validate_public_url
 from .extractors_rendering import _PlaywrightRenderer
@@ -38,6 +40,7 @@ __all__ = [
     "REQUEST_HEADERS",
     "TWEET_URL_PATTERN",
     "YOUTUBE_URL_PATTERN",
+    "YouTubeTranscriptExtractionResult",
     "WebExtractionResult",
     "_PlaywrightRenderer",
     "_clean_extracted_text",
@@ -54,5 +57,6 @@ __all__ = [
     "extract_web_result",
     "extract_web_text",
     "extract_youtube_transcript",
+    "extract_youtube_transcript_result",
     "trafilatura",
 ]

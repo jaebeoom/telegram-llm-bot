@@ -30,11 +30,12 @@ from extractors import (
     TWEET_URL_PATTERN,
     YOUTUBE_URL_PATTERN,
     GENERAL_URL_PATTERN,
+    YouTubeTranscriptExtractionResult,
     extract_tweet_from_url,
     extract_pdf_text,
     extract_pdf_from_url,
     extract_web_result,
-    extract_youtube_transcript,
+    extract_youtube_transcript_result,
 )
 
 ENV_FILES_LOADED: list[str] = []
@@ -130,6 +131,11 @@ source_memories: dict[SessionKey, list[SourceMemory]] = {}
 session_identifiers: dict[SessionKey, str] = {}
 last_activity_at_by_session: dict[SessionKey, float] = {}
 MAX_HISTORY_PAIRS = 10
+MAX_ASSISTANT_CONTEXT_CHARS = 700
+MAX_RECENT_ASSISTANT_CONTEXT_CHARS = 1200
+ASSISTANT_CONTEXT_TRUNCATION_NOTICE = (
+    "\n\n[이전 AI 답변 일부 생략. 같은 내용을 반복하지 말고 최신 질문에 필요한 부분만 참고.]"
+)
 
 
 def build_system_prompt(model_name: str, today: datetime | None = None) -> str:
@@ -380,6 +386,14 @@ SOURCE_QUERY_STOPWORDS = {
 SOURCE_FOLLOWUP_SKIP_RE = re.compile(
     r"(다른\s*얘기|다른\s*주제|방금\s*(거|것)\s*무시|컨텍스트\s*무시|원문\s*무시|"
     r"ignore\s+(the\s+)?(previous|context|source)|new\s+topic)",
+    re.IGNORECASE,
+)
+SOURCE_FOLLOWUP_REFERENCE_RE = re.compile(
+    r"(이\s*(글|기사|자료|문서|pdf|피디에프|링크|영상|유튜브|트윗|포스트|원문|컨텍스트)|"
+    r"위\s*(글|기사|자료|문서|내용|링크|영상|원문|컨텍스트)|"
+    r"방금\s*(보낸|올린|읽은|첨부한)\s*(글|기사|자료|문서|pdf|피디에프|링크|영상|원문)?|"
+    r"(원문|자료|문서|링크|소스|컨텍스트)(에서|에선|기준|기반|내용|관련)|"
+    r"(this|that|the|above|previous)\s+(article|source|context|document|link|pdf|video|transcript|post))",
     re.IGNORECASE,
 )
 EXPLICIT_RECENCY_SIGNAL_RE = re.compile(
@@ -1559,18 +1573,20 @@ async def extract_context_from_user_text(update: Update, user_id: int, user_text
         canonical_youtube_url = normalize_source_url(youtube_url, "youtube")
         await update.message.reply_text("🎬 스크립트 추출 중...")
         stage_started_at = asyncio.get_running_loop().time()
-        yt_context = await asyncio.to_thread(extract_youtube_transcript, video_id)
+        yt_result = await asyncio.to_thread(extract_youtube_transcript_result, video_id)
+        yt_context = yt_result.content
         log_stage_metrics(
             "extract",
             user_id,
             int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
             ok=bool(yt_context),
             source="youtube",
-            detail=video_id,
+            detail=f"{video_id}:{yt_result.status}",
             chars=len(yt_context) if yt_context else 0,
         )
         if not yt_context:
-            await update.message.reply_text("⚠️ 스크립트를 가져올 수 없습니다. (스크립트가 없는 영상일 수 있어요)")
+            failure_message = yt_result.message or "스크립트를 가져올 수 없습니다."
+            await update.message.reply_text(f"⚠️ {failure_message}")
             return ContextExtractionResult(matched=True)
 
         return ContextExtractionResult(
@@ -1735,6 +1751,35 @@ def trim_conversation_history(history: list[ChatMessage]) -> list[ChatMessage]:
     return history[-max_messages:]
 
 
+def compact_assistant_context(content: str, max_chars: int) -> str:
+    stripped = content.strip()
+    if len(stripped) <= max_chars:
+        return content
+    return f"{stripped[:max_chars].rstrip()}{ASSISTANT_CONTEXT_TRUNCATION_NOTICE}"
+
+
+def build_llm_context_history(history: list[ChatMessage]) -> list[ChatMessage]:
+    latest_assistant_index = None
+    for index in range(len(history) - 1, -1, -1):
+        if history[index].get("role") == "assistant":
+            latest_assistant_index = index
+            break
+
+    payload_history: list[ChatMessage] = []
+    for index, message in enumerate(history):
+        role = message.get("role", "")
+        content = message.get("content", "")
+        if role == "assistant":
+            max_chars = (
+                MAX_RECENT_ASSISTANT_CONTEXT_CHARS
+                if index == latest_assistant_index
+                else MAX_ASSISTANT_CONTEXT_CHARS
+            )
+            content = compact_assistant_context(content, max_chars)
+        payload_history.append({"role": role, "content": content})
+    return payload_history
+
+
 def has_recent_source_context(session_key: SessionKey, max_messages: int = 8) -> bool:
     memory = latest_source_memory(session_key)
     if memory:
@@ -1748,6 +1793,10 @@ def has_recent_source_context(session_key: SessionKey, max_messages: int = 8) ->
     return False
 
 
+def has_explicit_source_followup_reference(user_message: str) -> bool:
+    return bool(SOURCE_FOLLOWUP_REFERENCE_RE.search(user_message.strip()))
+
+
 def should_apply_source_followup_rules(session_key: SessionKey, user_message: str) -> bool:
     stripped = user_message.strip()
     if not stripped:
@@ -1755,6 +1804,8 @@ def should_apply_source_followup_rules(session_key: SessionKey, user_message: st
     if SOURCE_FOLLOWUP_SKIP_RE.search(stripped):
         return False
     if GENERAL_URL_PATTERN.search(stripped):
+        return False
+    if not has_explicit_source_followup_reference(stripped):
         return False
     return has_recent_source_context(session_key)
 
@@ -1837,7 +1888,7 @@ def prepare_messages(
         payload_history = conversations[session_key][:-1] + [{"role": "user", "content": payload_message}]
     else:
         payload_history = conversations[session_key]
-    return [{"role": "system", "content": system_prompt}] + payload_history
+    return [{"role": "system", "content": system_prompt}] + build_llm_context_history(payload_history)
 
 
 def build_context_prompt(user_message: str) -> str:

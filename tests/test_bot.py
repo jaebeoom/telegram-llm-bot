@@ -160,12 +160,12 @@ def test_source_followup_retrieves_relevant_chunk_without_storing_retrieval_prom
 
     effective_context, source_kind, source_url, store_context = bot.resolve_source_context_for_request(
         key,
-        "수요 신호만",
+        "이 글에서 수요 신호만",
         "",
     )
     messages = bot.prepare_messages(
         key,
-        "수요 신호만",
+        "이 글에서 수요 신호만",
         effective_context,
         source_kind=source_kind,
         source_url=source_url,
@@ -174,7 +174,7 @@ def test_source_followup_retrieves_relevant_chunk_without_storing_retrieval_prom
 
     assert "Selection mode: relevant" in messages[-1]["content"]
     assert "재고 회전" in messages[-1]["content"]
-    assert bot.conversations[key][-1] == {"role": "user", "content": "수요 신호만"}
+    assert bot.conversations[key][-1] == {"role": "user", "content": "이 글에서 수요 신호만"}
     assert bot.session_histories[key][-1]["source_kind"] == "web"
     assert bot.session_histories[key][-1]["source_url"] == "https://example.com/article"
 
@@ -297,7 +297,15 @@ def test_handle_message_with_youtube_share_url_uses_canonical_source(monkeypatch
         calls.append((user_id, user_message, search_context, source, source_kind, source_url))
 
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
-    monkeypatch.setattr(bot, "extract_youtube_transcript", lambda video_id: "[YouTube Transcript]\n본문")
+    monkeypatch.setattr(
+        bot,
+        "extract_youtube_transcript_result",
+        lambda video_id: bot.YouTubeTranscriptExtractionResult(
+            content="[YouTube Transcript]\n본문",
+            status="ok",
+            message="",
+        ),
+    )
     monkeypatch.setattr(bot, "stream_reply", fake_stream_reply)
 
     update = SimpleNamespace(
@@ -325,7 +333,15 @@ def test_handle_message_with_extract_suffix_returns_youtube_transcript_without_l
         pytest.fail("extract-only requests should not call the LLM")
 
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
-    monkeypatch.setattr(bot, "extract_youtube_transcript", lambda video_id: "[YouTube Transcript]\n원문 본문")
+    monkeypatch.setattr(
+        bot,
+        "extract_youtube_transcript_result",
+        lambda video_id: bot.YouTubeTranscriptExtractionResult(
+            content="[YouTube Transcript]\n원문 본문",
+            status="ok",
+            message="",
+        ),
+    )
     monkeypatch.setattr(bot, "stream_reply", fail_stream_reply)
 
     update = SimpleNamespace(
@@ -351,7 +367,15 @@ def test_handle_message_with_e_suffix_returns_youtube_transcript_without_llm(mon
         pytest.fail("extract-only requests should not call the LLM")
 
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
-    monkeypatch.setattr(bot, "extract_youtube_transcript", lambda video_id: "[YouTube Transcript]\n원문 본문")
+    monkeypatch.setattr(
+        bot,
+        "extract_youtube_transcript_result",
+        lambda video_id: bot.YouTubeTranscriptExtractionResult(
+            content="[YouTube Transcript]\n원문 본문",
+            status="ok",
+            message="",
+        ),
+    )
     monkeypatch.setattr(bot, "stream_reply", fail_stream_reply)
 
     update = SimpleNamespace(
@@ -364,6 +388,35 @@ def test_handle_message_with_e_suffix_returns_youtube_transcript_without_llm(mon
     assert update.message.replies == [
         "🎬 스크립트 추출 중...",
         "YouTube 스크립트\n\n원문 본문",
+    ]
+
+
+def test_handle_message_reports_specific_youtube_transcript_failure(monkeypatch):
+    async def fail_stream_reply(*_args, **_kwargs):
+        pytest.fail("missing YouTube transcript should not call the LLM")
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(
+        bot,
+        "extract_youtube_transcript_result",
+        lambda video_id: bot.YouTubeTranscriptExtractionResult(
+            content=None,
+            status="transcripts_disabled",
+            message="이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다.",
+        ),
+    )
+    monkeypatch.setattr(bot, "stream_reply", fail_stream_reply)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=21),
+        message=DummyMessage(text="https://youtu.be/abcdefghijk 요약"),
+    )
+
+    asyncio.run(bot.handle_message(update, None))
+
+    assert update.message.replies == [
+        "🎬 스크립트 추출 중...",
+        "⚠️ 이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다.",
     ]
 
 
@@ -865,14 +918,32 @@ def test_prepare_messages_applies_source_followup_rules_without_storing_them(mon
     ]
     bot.session_histories[key] = list(bot.conversations[key])
 
-    messages = bot.prepare_messages(key, "수요 신호만")
+    messages = bot.prepare_messages(key, "이 자료에서 수요 신호만")
 
     assert messages[-1]["role"] == "user"
     assert "[Follow-up Source Rules]" in messages[-1]["content"]
     assert "Treat the user's latest message as the priority lens" in messages[-1]["content"]
-    assert "[User Question]\n수요 신호만" in messages[-1]["content"]
-    assert bot.conversations[key][-1] == {"role": "user", "content": "수요 신호만"}
-    assert bot.session_histories[key][-1] == {"role": "user", "content": "수요 신호만"}
+    assert "[User Question]\n이 자료에서 수요 신호만" in messages[-1]["content"]
+    assert bot.conversations[key][-1] == {"role": "user", "content": "이 자료에서 수요 신호만"}
+    assert bot.session_histories[key][-1] == {"role": "user", "content": "이 자료에서 수요 신호만"}
+
+
+def test_prepare_messages_skips_source_followup_rules_without_explicit_source_reference(monkeypatch):
+    monkeypatch.setattr(bot, "build_system_prompt", lambda model_name: "prompt")
+    key = session_key(424)
+    bot.conversations[key] = [
+        {
+            "role": "user",
+            "content": "[Web Article]\n원문\n\n[Response Rules]\n...\n\n[User Question]\n요약",
+        },
+        {"role": "assistant", "content": "첫 요약"},
+    ]
+    bot.session_histories[key] = list(bot.conversations[key])
+
+    messages = bot.prepare_messages(key, "수요 신호만")
+
+    assert messages[-1] == {"role": "user", "content": "수요 신호만"}
+    assert "[Follow-up Source Rules]" not in messages[-1]["content"]
 
 
 def test_prepare_messages_skips_source_followup_rules_without_recent_context(monkeypatch):
@@ -929,6 +1000,30 @@ def test_prepare_messages_keeps_ten_pairs_plus_current_user(monkeypatch):
         {"role": "assistant", "content": "a11"},
     ]
     assert len(bot.session_histories[key]) == 22
+
+
+def test_prepare_messages_compacts_assistant_history_in_llm_payload(monkeypatch):
+    monkeypatch.setattr(bot, "build_system_prompt", lambda model_name: "prompt")
+    key = session_key(8)
+    old_answer = "오래된 답변 " * 200
+    recent_answer = "최근 답변 " * 300
+
+    bot.append_history_message(key, "user", "u1")
+    bot.append_history_message(key, "assistant", old_answer)
+    bot.append_history_message(key, "user", "u2")
+    bot.append_history_message(key, "assistant", recent_answer)
+
+    messages = bot.prepare_messages(key, "새 질문")
+    assistant_messages = [message for message in messages if message["role"] == "assistant"]
+
+    assert old_answer in [message["content"] for message in bot.session_histories[key]]
+    assert recent_answer in [message["content"] for message in bot.session_histories[key]]
+    assert assistant_messages[0]["content"].startswith("오래된 답변")
+    assert assistant_messages[1]["content"].startswith("최근 답변")
+    assert len(assistant_messages[0]["content"]) < len(old_answer)
+    assert len(assistant_messages[1]["content"]) < len(recent_answer)
+    assert "이전 AI 답변 일부 생략" in assistant_messages[0]["content"]
+    assert "이전 AI 답변 일부 생략" in assistant_messages[1]["content"]
 
 
 def test_build_draft_id_is_positive_non_zero():
