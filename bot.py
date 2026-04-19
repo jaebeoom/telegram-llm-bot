@@ -2027,6 +2027,7 @@ async def stream_reply(
     reasoning_disabled = bool(request_payload.get("chat_template_kwargs", {}).get("enable_thinking") is False)
 
     bot_msg = None
+    reasoning_status_msg = None
     full_text = ""
     display_text = ""
     last_edit_time = 0
@@ -2081,16 +2082,21 @@ async def stream_reply(
                 reasoning_chars += len(token)
 
                 if (
-                    stream_to_telegram
+                    (stream_to_telegram or TELEGRAM_RESPONSE_DELIVERY == "final")
                     and not reasoning_status_shown
                     and should_show_reasoning_status(reasoning_preview)
                 ):
-                    bot_msg, use_message_draft, shown, used_draft = await show_reasoning_status(
+                    status_target = bot_msg if stream_to_telegram else reasoning_status_msg
+                    status_target, use_message_draft, shown, used_draft = await show_reasoning_status(
                         update,
                         draft_id,
-                        use_message_draft,
-                        bot_msg,
+                        use_message_draft if stream_to_telegram else False,
+                        status_target,
                     )
+                    if stream_to_telegram:
+                        bot_msg = status_target
+                    else:
+                        reasoning_status_msg = status_target
                     draft_visible = draft_visible or used_draft
                     if shown:
                         reasoning_status_shown = True
@@ -2116,16 +2122,21 @@ async def stream_reply(
                 reasoning_used = True
                 reasoning_preview = full_text.split("<think>", 1)[-1]
                 if (
-                    stream_to_telegram
+                    (stream_to_telegram or TELEGRAM_RESPONSE_DELIVERY == "final")
                     and not reasoning_status_shown
                     and should_show_reasoning_status(reasoning_preview)
                 ):
-                    bot_msg, use_message_draft, shown, used_draft = await show_reasoning_status(
+                    status_target = bot_msg if stream_to_telegram else reasoning_status_msg
+                    status_target, use_message_draft, shown, used_draft = await show_reasoning_status(
                         update,
                         draft_id,
-                        use_message_draft,
-                        bot_msg,
+                        use_message_draft if stream_to_telegram else False,
+                        status_target,
                     )
+                    if stream_to_telegram:
+                        bot_msg = status_target
+                    else:
+                        reasoning_status_msg = status_target
                     draft_visible = draft_visible or used_draft
                     if shown:
                         reasoning_status_shown = True
@@ -2257,6 +2268,10 @@ async def stream_reply(
                         await update.message.reply_text(chunk)
                 else:
                     await bot_msg.edit_text(final_text)
+
+            if reasoning_status_msg is not None:
+                with suppress(Exception):
+                    await reasoning_status_msg.delete()
         except BadRequest as e:
             if "Message is not modified" not in str(e):
                 raise
@@ -2290,6 +2305,9 @@ async def stream_reply(
         logger.error(f"LLM error: {e}")
         error_text = f"⚠️ {LLM_PROVIDER_NAME} 연결 실패: {e}"
         typing_stop_event.set()
+        if reasoning_status_msg is not None:
+            with suppress(Exception):
+                await reasoning_status_msg.delete()
         if bot_msg is not None:
             await bot_msg.edit_text(error_text)
         else:

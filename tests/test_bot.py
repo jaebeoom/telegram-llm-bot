@@ -64,6 +64,7 @@ class DummyReply:
     def __init__(self, text):
         self.text = text
         self.edits = []
+        self.deleted = False
 
     async def edit_text(self, text):
         self.text = text
@@ -71,6 +72,7 @@ class DummyReply:
         return self
 
     async def delete(self):
+        self.deleted = True
         return None
 
 
@@ -1492,7 +1494,7 @@ def test_stream_reply_shows_reasoning_status_before_content(monkeypatch):
     assert bot.conversations[session_key(777)][-1] == {"role": "assistant", "content": "323"}
 
 
-def test_stream_reply_final_delivery_hides_reasoning_status(monkeypatch):
+def test_stream_reply_final_delivery_sends_temporary_reasoning_status(monkeypatch):
     bot.conversations.clear()
 
     def fake_stream(messages, loop, queue):
@@ -1513,7 +1515,11 @@ def test_stream_reply_final_delivery_hides_reasoning_status(monkeypatch):
     asyncio.run(bot.stream_reply(update, 779, "질문"))
 
     assert dummy_bot.drafts == []
-    assert message.replies == ["323"]
+    assert message.replies == ["🧠 추론 중...", "323"]
+    assert message.reply_messages[0].deleted is True
+    assert message.reply_messages[0].edits == []
+    assert message.reply_messages[1].deleted is False
+    assert message.reply_messages[1].edits == []
     assert bot.conversations[session_key(779)][-1] == {"role": "assistant", "content": "323"}
 
 
