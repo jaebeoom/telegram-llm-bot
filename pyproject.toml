@@ -18,6 +18,8 @@ dependencies = [
     "trafilatura>=1.6",
     "playwright>=1.52",
     "readability-lxml>=0.8.1",
+    "mlx-whisper>=0.4.3",
+    "yt-dlp[default]>=2026.2.4",
 ]
 
 [dependency-groups]

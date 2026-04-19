@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from concurrent.futures import Future
 import subprocess
 import sys
+from xml.etree.ElementTree import ParseError
 
 from extractors import (
     _PlaywrightRenderer,
@@ -10,6 +11,7 @@ from extractors import (
     extract_tweet_from_url,
     extract_web_text,
 )
+from extractors_content import _format_youtube_transcript_error
 
 
 def test_clean_extracted_text_filters_browser_gate_noise():
@@ -31,6 +33,13 @@ def test_importing_extractors_does_not_import_fitz():
     )
 
     assert result.stdout.strip() == "False"
+
+
+def test_youtube_transcript_parse_error_reports_specific_status():
+    status, message = _format_youtube_transcript_error(ParseError("not well-formed"))
+
+    assert status == "transcript_parse_error"
+    assert message == "공개 자막 데이터가 깨져서 읽을 수 없습니다."
 
 
 def test_extract_web_text_follows_iframe_when_outer_page_has_no_article(monkeypatch):

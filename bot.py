@@ -5,7 +5,10 @@ import re
 import asyncio
 import json
 import logging
+import sys
 import time
+import shutil
+import subprocess
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -130,12 +133,23 @@ session_histories: dict[SessionKey, list[ChatMessage]] = {}
 source_memories: dict[SessionKey, list[SourceMemory]] = {}
 session_identifiers: dict[SessionKey, str] = {}
 last_activity_at_by_session: dict[SessionKey, float] = {}
+pending_youtube_transcriptions: dict[SessionKey, PendingYouTubeTranscription] = {}
+youtube_audio_transcription_semaphore: asyncio.Semaphore | None = None
 MAX_HISTORY_PAIRS = 10
 MAX_ASSISTANT_CONTEXT_CHARS = 700
 MAX_RECENT_ASSISTANT_CONTEXT_CHARS = 1200
 ASSISTANT_CONTEXT_TRUNCATION_NOTICE = (
     "\n\n[이전 AI 답변 일부 생략. 같은 내용을 반복하지 말고 최신 질문에 필요한 부분만 참고.]"
 )
+YOUTUBE_AUDIO_TRANSCRIPTION_MODEL = "mlx-community/whisper-large-v3-turbo"
+YOUTUBE_TRANSCRIPTION_CONFIRM_TTL_SECONDS = 600
+YOUTUBE_TRANSCRIPTION_ACCEPT_RESPONSES = {"1", "예", "yes", "y"}
+YOUTUBE_TRANSCRIPTION_DECLINE_RESPONSES = {"2", "아니요", "no", "n"}
+YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES = {
+    "transcripts_disabled",
+    "no_transcript_found",
+    "transcript_parse_error",
+}
 
 
 def build_system_prompt(model_name: str, today: datetime | None = None) -> str:
@@ -218,6 +232,7 @@ TELEGRAM_RESPONSE_DELIVERY = parse_telegram_response_delivery()
 ENABLE_THINKING_FOR_CONTEXT = parse_enable_thinking_for_context()
 ENABLE_AUTO_SEARCH = parse_bool_env("ENABLE_AUTO_SEARCH", True)
 ENABLE_RESPONSE_VALIDATION = parse_bool_env("ENABLE_RESPONSE_VALIDATION", True)
+ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION = parse_bool_env("ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION", False)
 
 
 def parse_positive_float_env(name: str, default: float) -> float:
@@ -233,6 +248,23 @@ def parse_positive_float_env(name: str, default: float) -> float:
 
     if parsed <= 0:
         logging.getLogger(__name__).warning("%s must be greater than 0; using default %s", name, default)
+        return default
+    return parsed
+
+
+def parse_nonnegative_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        parsed = float(raw_value.strip())
+    except ValueError:
+        logging.getLogger(__name__).warning("%s must be a non-negative number; using default %s", name, default)
+        return default
+
+    if parsed < 0:
+        logging.getLogger(__name__).warning("%s must be greater than or equal to 0; using default %s", name, default)
         return default
     return parsed
 
@@ -266,6 +298,14 @@ RESPONSE_REWRITE_MAX_ATTEMPTS = parse_positive_int_env(
     "RESPONSE_REWRITE_MAX_ATTEMPTS",
     3,
 )
+YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS = parse_nonnegative_float_env(
+    "YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS",
+    0,
+)
+YOUTUBE_AUDIO_TRANSCRIPTION_MAX_CONCURRENT = parse_positive_int_env(
+    "YOUTUBE_AUDIO_TRANSCRIPTION_MAX_CONCURRENT",
+    1,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -282,9 +322,10 @@ if ENV_FILES_LOADED:
 else:
     logger.warning("No env files were loaded.")
 logger.info(
-    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s",
+    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s youtube_audio_transcription=%s",
     TELEGRAM_RESPONSE_DELIVERY,
     ENABLE_THINKING_FOR_CONTEXT,
+    ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION,
 )
 
 
@@ -418,6 +459,21 @@ class AutoSearchDecision:
     query: str = ""
     reason: str = ""
     source: str = "none"
+
+
+@dataclass(frozen=True)
+class PendingYouTubeTranscription:
+    video_id: str
+    youtube_url: str
+    canonical_youtube_url: str | None
+    user_message: str
+    extract_only_requested: bool
+    requested_at: float
+    failure_status: str
+    failure_message: str
+    title: str = ""
+    channel: str = ""
+    duration: int | None = None
 
 
 @dataclass(frozen=True)
@@ -959,6 +1015,149 @@ def infer_source_type(context_part: str, source_kind: str | None = None) -> str:
     return "참고 자료"
 
 
+def format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "알 수 없음"
+    hours, remainder = divmod(max(0, seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}시간 {minutes}분 {secs}초"
+    if minutes:
+        return f"{minutes}분 {secs}초"
+    return f"{secs}초"
+
+
+def youtube_audio_transcription_runtime_issue() -> str | None:
+    if not ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION:
+        return "오디오 전사 fallback이 비활성화되어 있습니다."
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        return "오디오 전사에는 ffmpeg와 ffprobe가 필요합니다."
+    return None
+
+
+def youtube_audio_worker_env() -> dict[str, str]:
+    env = os.environ.copy()
+    src_dir = Path(__file__).resolve().parent / "src"
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(src_dir) if not existing_pythonpath else f"{src_dir}{os.pathsep}{existing_pythonpath}"
+    return env
+
+
+def youtube_audio_worker_command(*args: str) -> list[str]:
+    return [sys.executable, "-m", "telegram_llm_bot.youtube_audio_transcription", *args]
+
+
+def parse_json_lines(text: str) -> list[dict]:
+    parsed: list[dict] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            parsed.append(value)
+    return parsed
+
+
+def fetch_youtube_audio_metadata_for_prompt(video_id: str) -> tuple[dict | None, bool, str]:
+    try:
+        completed = subprocess.run(
+            youtube_audio_worker_command("metadata", video_id),
+            cwd=Path(__file__).resolve().parent,
+            env=youtube_audio_worker_env(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        logger.warning("YouTube audio metadata lookup failed: %s", exc)
+        return None, True, ""
+
+    json_lines = parse_json_lines(completed.stdout)
+    if not json_lines:
+        if completed.stderr.strip():
+            logger.warning("YouTube audio metadata lookup stderr: %s", completed.stderr.strip()[-500:])
+        return None, completed.returncode == 0, ""
+    payload = json_lines[-1]
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None
+    return metadata, bool(payload.get("ok", completed.returncode == 0)), str(payload.get("reason") or "")
+
+
+def build_youtube_transcription_prompt(pending: PendingYouTubeTranscription) -> str:
+    detail_lines = [
+        "공개 자막을 가져오지 못했어요.",
+        f"사유: {pending.failure_message}",
+    ]
+    detail_lines.extend(
+        [
+            "",
+            "오디오를 받아서 로컬 전사를 시도할까요?",
+            "1. 예",
+            "2. 아니요",
+            "",
+            "답장은 1 또는 2로 보내주세요. 예/아니요도 됩니다.",
+        ]
+    )
+    return "\n".join(detail_lines)
+
+
+def build_pending_youtube_transcription(
+    video_id: str,
+    youtube_url: str,
+    canonical_youtube_url: str | None,
+    user_message: str,
+    extract_only_requested: bool,
+    yt_result: YouTubeTranscriptExtractionResult,
+) -> tuple[PendingYouTubeTranscription | None, str | None]:
+    if yt_result.status not in YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES:
+        return None, None
+
+    runtime_issue = youtube_audio_transcription_runtime_issue()
+    if runtime_issue:
+        return None, runtime_issue
+
+    metadata, allowed, reason = fetch_youtube_audio_metadata_for_prompt(video_id)
+    if not allowed:
+        return None, reason or "오디오 전사 요청이 설정 한도를 넘었습니다."
+
+    return (
+        PendingYouTubeTranscription(
+            video_id=video_id,
+            youtube_url=youtube_url,
+            canonical_youtube_url=canonical_youtube_url,
+            user_message=user_message,
+            extract_only_requested=extract_only_requested,
+            requested_at=time.time(),
+            failure_status=yt_result.status,
+            failure_message=yt_result.message or "공개 스크립트/자막을 가져올 수 없습니다.",
+            title=str((metadata or {}).get("title") or ""),
+            channel=str((metadata or {}).get("channel") or ""),
+            duration=(metadata or {}).get("duration") if isinstance((metadata or {}).get("duration"), int) else None,
+        ),
+        None,
+    )
+
+
+def parse_youtube_transcription_confirmation(text: str) -> str:
+    normalized = text.strip().casefold()
+    if normalized in YOUTUBE_TRANSCRIPTION_ACCEPT_RESPONSES:
+        return "accept"
+    if normalized in YOUTUBE_TRANSCRIPTION_DECLINE_RESPONSES:
+        return "decline"
+    return "ambiguous"
+
+
+def get_youtube_audio_transcription_semaphore() -> asyncio.Semaphore:
+    global youtube_audio_transcription_semaphore
+    if youtube_audio_transcription_semaphore is None:
+        youtube_audio_transcription_semaphore = asyncio.Semaphore(YOUTUBE_AUDIO_TRANSCRIPTION_MAX_CONCURRENT)
+    return youtube_audio_transcription_semaphore
+
+
 def normalize_message_thread_id(message_thread_id: object) -> int:
     if isinstance(message_thread_id, int):
         return message_thread_id
@@ -992,13 +1191,27 @@ def clear_session_state(session_key: SessionKey) -> None:
     source_memories.pop(session_key, None)
     session_identifiers.pop(session_key, None)
     last_activity_at_by_session.pop(session_key, None)
+    pending_youtube_transcriptions.pop(session_key, None)
 
 
 def touch_session_activity(session_key: SessionKey, now: float | None = None) -> None:
     last_activity_at_by_session[session_key] = now if now is not None else time.time()
 
 
+def cleanup_expired_youtube_transcription_prompts(now: float | None = None) -> list[SessionKey]:
+    current_time = now if now is not None else time.time()
+    expired_keys = [
+        session_key
+        for session_key, pending in pending_youtube_transcriptions.items()
+        if current_time - pending.requested_at >= YOUTUBE_TRANSCRIPTION_CONFIRM_TTL_SECONDS
+    ]
+    for session_key in expired_keys:
+        pending_youtube_transcriptions.pop(session_key, None)
+    return expired_keys
+
+
 def cleanup_inactive_sessions(now: float | None = None) -> list[SessionKey]:
+    cleanup_expired_youtube_transcription_prompts(now)
     if SESSION_INACTIVE_TTL_SECONDS is None:
         return []
 
@@ -1535,7 +1748,14 @@ def log_stage_metrics(
     )
 
 
-async def extract_context_from_user_text(update: Update, user_id: int, user_text: str) -> ContextExtractionResult:
+async def extract_context_from_user_text(
+    update: Update,
+    user_id: int,
+    user_text: str,
+    *,
+    session_key: SessionKey | None = None,
+    extract_only_requested: bool = False,
+) -> ContextExtractionResult:
     tweet_match = TWEET_URL_PATTERN.search(user_text)
     if tweet_match:
         tweet_url = find_matching_url(user_text, TWEET_URL_PATTERN) or tweet_match.group(0)
@@ -1586,6 +1806,23 @@ async def extract_context_from_user_text(update: Update, user_id: int, user_text
         )
         if not yt_context:
             failure_message = yt_result.message or "스크립트를 가져올 수 없습니다."
+            if session_key is not None:
+                pending, fallback_issue = await asyncio.to_thread(
+                    build_pending_youtube_transcription,
+                    video_id,
+                    youtube_url,
+                    canonical_youtube_url,
+                    remove_url_once(user_text, youtube_url),
+                    extract_only_requested,
+                    yt_result,
+                )
+                if pending is not None:
+                    pending_youtube_transcriptions[session_key] = pending
+                    await update.message.reply_text(build_youtube_transcription_prompt(pending))
+                    return ContextExtractionResult(matched=True)
+                if fallback_issue and ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION:
+                    await update.message.reply_text(f"⚠️ {failure_message}\n\n{fallback_issue}")
+                    return ContextExtractionResult(matched=True)
             await update.message.reply_text(f"⚠️ {failure_message}")
             return ContextExtractionResult(matched=True)
 
@@ -1680,6 +1917,138 @@ async def send_extract_only_reply(update: Update, session_key: SessionKey, extra
     )
     session_histories[session_key].append({"role": "assistant", "content": output_text})
     touch_session_activity(session_key)
+
+
+async def run_youtube_audio_transcription_worker(
+    update: Update,
+    pending: PendingYouTubeTranscription,
+) -> dict:
+    process = await asyncio.create_subprocess_exec(
+        *youtube_audio_worker_command("transcribe", pending.video_id),
+        cwd=Path(__file__).resolve().parent,
+        env=youtube_audio_worker_env(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    result_payload: dict | None = None
+    last_progress: tuple[int, int] | None = None
+
+    try:
+        assert process.stdout is not None
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            try:
+                payload = json.loads(line.decode("utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("event") == "chunk_done":
+                current = int(payload.get("index") or 0)
+                total = int(payload.get("total") or 0)
+                if current and total and (current, total) != last_progress:
+                    last_progress = (current, total)
+                    await update.message.reply_text(f"🎙️ 오디오 전사 진행 중... {current}/{total}")
+                continue
+            if "ok" in payload:
+                result_payload = payload
+
+        stderr_text = ""
+        if process.stderr is not None:
+            stderr_text = (await process.stderr.read()).decode("utf-8", errors="replace").strip()
+        return_code = await process.wait()
+        if result_payload is None:
+            detail = stderr_text[-800:] if stderr_text else f"worker exited with code {return_code}"
+            return {"ok": False, "status": "worker_error", "message": detail}
+        if return_code != 0 and result_payload.get("ok") is not True:
+            if stderr_text:
+                result_payload["message"] = f"{result_payload.get('message') or ''}\n{stderr_text[-800:]}".strip()
+        return result_payload
+    except asyncio.CancelledError:
+        with suppress(ProcessLookupError):
+            process.kill()
+        with suppress(Exception):
+            await process.wait()
+        raise
+
+
+async def handle_pending_youtube_transcription_response(
+    update: Update,
+    user_id: int,
+    session_key: SessionKey,
+    user_text: str,
+) -> bool:
+    pending = pending_youtube_transcriptions.get(session_key)
+    if pending is None:
+        return False
+
+    pending_youtube_transcriptions.pop(session_key, None)
+    decision = parse_youtube_transcription_confirmation(user_text)
+    if decision == "decline":
+        await update.message.reply_text("오디오 전사는 취소할게요.")
+        return True
+    if decision != "accept":
+        await update.message.reply_text(
+            "잘 못 알아들어서 전사는 시작하지 않았어요. YouTube URL을 다시 보내면 다시 물어볼게요."
+        )
+        return True
+
+    await update.message.reply_text("🎙️ 오디오 전사를 시작할게요.")
+    started_at = asyncio.get_running_loop().time()
+    try:
+        async with get_youtube_audio_transcription_semaphore():
+            if YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS > 0:
+                result = await asyncio.wait_for(
+                    run_youtube_audio_transcription_worker(update, pending),
+                    timeout=YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS,
+                )
+            else:
+                result = await run_youtube_audio_transcription_worker(update, pending)
+    except asyncio.TimeoutError:
+        result = {
+            "ok": False,
+            "status": "timeout",
+            "message": "오디오 전사 작업이 제한 시간 안에 끝나지 않았습니다.",
+        }
+    elapsed_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
+    content = result.get("content") if isinstance(result.get("content"), str) else ""
+    log_stage_metrics(
+        "youtube_audio_transcription",
+        user_id,
+        elapsed_ms,
+        ok=bool(result.get("ok")),
+        source="youtube_audio",
+        detail=f"{pending.video_id}:{result.get('status')}",
+        chars=len(content),
+    )
+    if not result.get("ok") or not content:
+        message = str(result.get("message") or "오디오 전사에 실패했습니다.")
+        await update.message.reply_text(f"⚠️ {message}")
+        return True
+
+    extracted = ExtractedContext(
+        user_message=pending.user_message,
+        content=content,
+        source="youtube_audio",
+        source_kind="youtube",
+        source_url=pending.canonical_youtube_url,
+    )
+    if pending.extract_only_requested:
+        await send_extract_only_reply(update, session_key, extracted)
+        return True
+
+    await stream_context_reply(
+        update,
+        user_id,
+        pending.user_message,
+        content,
+        source="youtube_audio",
+        source_kind="youtube",
+        source_url=pending.canonical_youtube_url,
+    )
+    return True
 
 
 async def send_message_draft(update: Update, draft_id: int, text: str) -> bool:
@@ -2386,9 +2755,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
         return
+    if current_session_key is not None:
+        handled_pending = await handle_pending_youtube_transcription_response(
+            update,
+            user_id,
+            current_session_key,
+            user_text,
+        )
+        if handled_pending:
+            return
 
     routed_text, extract_only_requested = parse_extract_only_request(user_text)
-    extraction_result = await extract_context_from_user_text(update, user_id, routed_text)
+    extraction_result = await extract_context_from_user_text(
+        update,
+        user_id,
+        routed_text,
+        session_key=current_session_key,
+        extract_only_requested=extract_only_requested,
+    )
     if extraction_result.matched:
         extracted = extraction_result.extracted
         if extracted is None:
@@ -2518,7 +2902,13 @@ async def handle_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("사용법: /e URL 또는 URL /e")
         return
 
-    extraction_result = await extract_context_from_user_text(update, user_id, query)
+    extraction_result = await extract_context_from_user_text(
+        update,
+        user_id,
+        query,
+        session_key=current_session_key,
+        extract_only_requested=True,
+    )
     if not extraction_result.matched:
         await update.message.reply_text("사용법: /e URL 또는 URL /e")
         return

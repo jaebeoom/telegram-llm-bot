@@ -20,12 +20,16 @@ def clear_histories():
     bot.source_memories.clear()
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
+    bot.pending_youtube_transcriptions.clear()
+    bot.youtube_audio_transcription_semaphore = None
     yield
     bot.conversations.clear()
     bot.session_histories.clear()
     bot.source_memories.clear()
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
+    bot.pending_youtube_transcriptions.clear()
+    bot.youtube_audio_transcription_semaphore = None
 
 
 class DummyFile:
@@ -398,6 +402,7 @@ def test_handle_message_reports_specific_youtube_transcript_failure(monkeypatch)
         pytest.fail("missing YouTube transcript should not call the LLM")
 
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION", False)
     monkeypatch.setattr(
         bot,
         "extract_youtube_transcript_result",
@@ -419,6 +424,151 @@ def test_handle_message_reports_specific_youtube_transcript_failure(monkeypatch)
     assert update.message.replies == [
         "🎬 스크립트 추출 중...",
         "⚠️ 이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다.",
+    ]
+
+
+def test_handle_message_prompts_for_youtube_audio_transcription_when_enabled(monkeypatch):
+    async def fail_stream_reply(*_args, **_kwargs):
+        pytest.fail("pending YouTube audio transcription should wait for confirmation")
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION", True)
+    monkeypatch.setattr(bot.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        bot,
+        "fetch_youtube_audio_metadata_for_prompt",
+        lambda video_id: (
+            {
+                "title": "Long interview",
+                "channel": "Test Channel",
+                "duration": 5400,
+            },
+            True,
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        bot,
+        "extract_youtube_transcript_result",
+        lambda video_id: bot.YouTubeTranscriptExtractionResult(
+            content=None,
+            status="transcripts_disabled",
+            message="이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다.",
+        ),
+    )
+    monkeypatch.setattr(bot, "stream_reply", fail_stream_reply)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=22),
+        message=DummyMessage(text="https://youtu.be/abcdefghijk 요약"),
+    )
+
+    asyncio.run(bot.handle_message(update, None))
+    pending = bot.pending_youtube_transcriptions[session_key(22)]
+
+    assert pending.video_id == "abcdefghijk"
+    assert pending.user_message == "요약"
+    assert pending.duration == 5400
+    assert "오디오를 받아서 로컬 전사를 시도할까요?" in update.message.replies[-1]
+    assert "1. 예" in update.message.replies[-1]
+    assert "2. 아니요" in update.message.replies[-1]
+    assert "전사하기" not in update.message.replies[-1]
+    assert "취소" not in update.message.replies[-1]
+    assert "Long interview" not in update.message.replies[-1]
+    assert "Test Channel" not in update.message.replies[-1]
+    assert "길이:" not in update.message.replies[-1]
+    assert "전사 모델:" not in update.message.replies[-1]
+
+
+def test_youtube_transcript_parse_error_is_audio_fallback_eligible():
+    assert "transcript_parse_error" in bot.YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES
+
+
+def test_handle_message_accepts_pending_youtube_audio_transcription(monkeypatch):
+    calls = []
+
+    async def fake_stream_context_reply(
+        update,
+        user_id,
+        user_message,
+        search_context,
+        source="context",
+        source_kind=None,
+        source_url=None,
+    ):
+        calls.append((user_id, user_message, search_context, source, source_kind, source_url))
+
+    async def fake_worker(update, pending):
+        return {
+            "ok": True,
+            "status": "ok",
+            "message": "transcribed",
+            "content": "[YouTube Transcript]\n전사 본문",
+        }
+
+    key = session_key(23)
+    bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
+        video_id="abcdefghijk",
+        youtube_url="https://youtu.be/abcdefghijk",
+        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        user_message="요약",
+        extract_only_requested=False,
+        requested_at=bot.time.time(),
+        failure_status="transcripts_disabled",
+        failure_message="자막 비활성화",
+    )
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "run_youtube_audio_transcription_worker", fake_worker)
+    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
+    monkeypatch.setattr(bot, "resolve_auto_search_decision", lambda *_args, **_kwargs: bot.AutoSearchDecision(False))
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=23),
+        message=DummyMessage(text="1"),
+    )
+
+    asyncio.run(bot.handle_message(update, None))
+
+    assert key not in bot.pending_youtube_transcriptions
+    assert update.message.replies == [
+        "🎙️ 오디오 전사를 시작할게요."
+    ]
+    assert calls == [
+        (
+            23,
+            "요약",
+            "[YouTube Transcript]\n전사 본문",
+            "youtube_audio",
+            "youtube",
+            "https://www.youtube.com/watch?v=abcdefghijk",
+        )
+    ]
+
+
+def test_handle_message_rejects_ambiguous_youtube_audio_confirmation(monkeypatch):
+    key = session_key(24)
+    bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
+        video_id="abcdefghijk",
+        youtube_url="https://youtu.be/abcdefghijk",
+        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        user_message="요약",
+        extract_only_requested=False,
+        requested_at=bot.time.time(),
+        failure_status="transcripts_disabled",
+        failure_message="자막 비활성화",
+    )
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=24),
+        message=DummyMessage(text="해줘"),
+    )
+
+    asyncio.run(bot.handle_message(update, None))
+
+    assert key not in bot.pending_youtube_transcriptions
+    assert update.message.replies == [
+        "잘 못 알아들어서 전사는 시작하지 않았어요. YouTube URL을 다시 보내면 다시 물어볼게요."
     ]
 
 

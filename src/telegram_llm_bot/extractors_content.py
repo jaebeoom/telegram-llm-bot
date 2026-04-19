@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from xml.etree.ElementTree import ParseError
 from urllib.parse import urlparse
 
 import requests
@@ -173,6 +174,11 @@ def _format_youtube_transcript_error(exc: Exception) -> tuple[str, str]:
         )
     if isinstance(exc, InvalidVideoId):
         return ("invalid_video_id", "YouTube 영상 ID가 올바르지 않습니다.")
+    if isinstance(exc, ParseError):
+        return (
+            "transcript_parse_error",
+            "공개 자막 데이터가 깨져서 읽을 수 없습니다.",
+        )
     return ("transcript_error", "YouTube 스크립트를 가져오는 중 오류가 발생했습니다.")
 
 
