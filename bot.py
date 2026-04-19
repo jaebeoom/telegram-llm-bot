@@ -156,30 +156,59 @@ DEFAULT_CONTEXT_PROMPT = "이 내용을 한국어로 간단히 요약해줘."
 RESPONSE_VALIDATION_FAILURE_TEXT = "⚠️ 응답이 한국어 출력 규칙을 통과하지 못했습니다. 다시 요청해 주세요."
 DRAFT_STREAM_FINAL_FLUSH_DELAY = 0.30
 MIN_REASONING_STATUS_CHARS = 2
-ENABLE_TELEGRAM_DRAFT_STREAMING = os.getenv("ENABLE_TELEGRAM_DRAFT_STREAMING", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-DISABLE_THINKING_FOR_CONTEXT = os.getenv("DISABLE_THINKING_FOR_CONTEXT", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-ENABLE_AUTO_SEARCH = os.getenv("ENABLE_AUTO_SEARCH", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-ENABLE_RESPONSE_VALIDATION = os.getenv("ENABLE_RESPONSE_VALIDATION", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+TELEGRAM_RESPONSE_DELIVERY_MODES = {"final", "draft", "edit"}
+
+
+def parse_bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in TRUE_ENV_VALUES:
+        return True
+    if normalized in FALSE_ENV_VALUES:
+        return False
+
+    logging.getLogger(__name__).warning("%s must be a boolean value; using default %s", name, default)
+    return default
+
+
+def parse_telegram_response_delivery() -> str:
+    raw_value = os.getenv("TELEGRAM_RESPONSE_DELIVERY")
+    if raw_value is not None:
+        mode = raw_value.strip().lower()
+        if mode in TELEGRAM_RESPONSE_DELIVERY_MODES:
+            return mode
+        logging.getLogger(__name__).warning(
+            "TELEGRAM_RESPONSE_DELIVERY must be one of %s; using final",
+            ", ".join(sorted(TELEGRAM_RESPONSE_DELIVERY_MODES)),
+        )
+        return "final"
+
+    legacy_draft_streaming = os.getenv("ENABLE_TELEGRAM_DRAFT_STREAMING")
+    if legacy_draft_streaming is not None:
+        return "draft" if parse_bool_env("ENABLE_TELEGRAM_DRAFT_STREAMING", True) else "edit"
+
+    return "final"
+
+
+def parse_enable_thinking_for_context() -> bool:
+    if os.getenv("ENABLE_THINKING_FOR_CONTEXT") is not None:
+        return parse_bool_env("ENABLE_THINKING_FOR_CONTEXT", True)
+
+    if os.getenv("DISABLE_THINKING_FOR_CONTEXT") is not None:
+        return not parse_bool_env("DISABLE_THINKING_FOR_CONTEXT", False)
+
+    return True
+
+
+TELEGRAM_RESPONSE_DELIVERY = parse_telegram_response_delivery()
+ENABLE_THINKING_FOR_CONTEXT = parse_enable_thinking_for_context()
+ENABLE_AUTO_SEARCH = parse_bool_env("ENABLE_AUTO_SEARCH", True)
+ENABLE_RESPONSE_VALIDATION = parse_bool_env("ENABLE_RESPONSE_VALIDATION", True)
 
 
 def parse_positive_float_env(name: str, default: float) -> float:
@@ -243,6 +272,11 @@ if ENV_FILES_LOADED:
     logger.info("Loaded env files: %s", ", ".join(ENV_FILES_LOADED))
 else:
     logger.warning("No env files were loaded.")
+logger.info(
+    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s",
+    TELEGRAM_RESPONSE_DELIVERY,
+    ENABLE_THINKING_FOR_CONTEXT,
+)
 
 
 REPLACEMENT_CHAR = "\ufffd"
@@ -1462,7 +1496,7 @@ def build_chat_completion_payload(messages: list[dict], search_context: str = ""
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if search_context and DISABLE_THINKING_FOR_CONTEXT:
+    if search_context and not ENABLE_THINKING_FOR_CONTEXT:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     return payload
 
@@ -1583,7 +1617,8 @@ async def stream_reply(
     last_streamed_length = 0
     inside_think = False
     reasoning_status_shown = False
-    use_message_draft = ENABLE_TELEGRAM_DRAFT_STREAMING
+    stream_to_telegram = TELEGRAM_RESPONSE_DELIVERY in {"draft", "edit"}
+    use_message_draft = TELEGRAM_RESPONSE_DELIVERY == "draft"
     draft_visible = False
     draft_id = build_draft_id()
     loop = asyncio.get_running_loop()
@@ -1628,7 +1663,11 @@ async def stream_reply(
                 reasoning_preview += token
                 reasoning_chars += len(token)
 
-                if not reasoning_status_shown and should_show_reasoning_status(reasoning_preview):
+                if (
+                    stream_to_telegram
+                    and not reasoning_status_shown
+                    and should_show_reasoning_status(reasoning_preview)
+                ):
                     bot_msg, use_message_draft, shown, used_draft = await show_reasoning_status(
                         update,
                         draft_id,
@@ -1659,7 +1698,11 @@ async def stream_reply(
                 inside_think = True
                 reasoning_used = True
                 reasoning_preview = full_text.split("<think>", 1)[-1]
-                if not reasoning_status_shown and should_show_reasoning_status(reasoning_preview):
+                if (
+                    stream_to_telegram
+                    and not reasoning_status_shown
+                    and should_show_reasoning_status(reasoning_preview)
+                ):
                     bot_msg, use_message_draft, shown, used_draft = await show_reasoning_status(
                         update,
                         draft_id,
@@ -1684,6 +1727,8 @@ async def stream_reply(
             display_text = normalize_response_text(full_text)
 
             if not display_text:
+                continue
+            if not stream_to_telegram:
                 continue
 
             # draft 또는 edit 기반 표시를 일정 간격으로 갱신한다.
@@ -1785,6 +1830,8 @@ async def stream_reply(
             else:
                 if bot_msg is None:
                     bot_msg = await update.message.reply_text(final_chunks[0])
+                    if first_visible_at is None:
+                        first_visible_at = loop.time()
                     for chunk in final_chunks[1:]:
                         await update.message.reply_text(chunk)
                 elif len(final_text) > TELEGRAM_TEXT_LIMIT:
@@ -1808,7 +1855,7 @@ async def stream_reply(
             "Stream metrics user=%s source=%s mode=%s reasoning_disabled=%s reasoning_used=%s reasoning_chars=%s reasoning_tokens=%s first_token_ms=%s first_reasoning_ms=%s first_content_ms=%s first_visible_ms=%s total_ms=%s updates=%s chars=%s",
             user_id,
             source,
-            "draft" if use_message_draft else "edit",
+            "draft" if use_message_draft else ("edit" if stream_to_telegram else "final"),
             reasoning_disabled,
             reasoning_used,
             reasoning_chars,

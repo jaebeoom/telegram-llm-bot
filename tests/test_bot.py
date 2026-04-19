@@ -111,6 +111,10 @@ def session_key(user_id: int, chat_id: int = 999, message_thread_id: int | None 
     return (user_id, chat_id, message_thread_id or 0)
 
 
+def use_delivery(monkeypatch, mode: str):
+    monkeypatch.setattr(bot, "TELEGRAM_RESPONSE_DELIVERY", mode)
+
+
 def test_build_context_prompt_uses_default_for_blank_text():
     assert bot.build_context_prompt("   ") == "이 내용을 한국어로 간단히 요약해줘."
 
@@ -853,8 +857,32 @@ def test_build_draft_id_is_positive_non_zero():
     assert bot.build_draft_id() > 0
 
 
-def test_build_chat_completion_payload_disables_thinking_for_context(monkeypatch):
-    monkeypatch.setattr(bot, "DISABLE_THINKING_FOR_CONTEXT", True)
+def test_parse_telegram_response_delivery_defaults_to_final(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_RESPONSE_DELIVERY", raising=False)
+    monkeypatch.delenv("ENABLE_TELEGRAM_DRAFT_STREAMING", raising=False)
+
+    assert bot.parse_telegram_response_delivery() == "final"
+
+
+def test_parse_telegram_response_delivery_supports_legacy_draft_flag(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_RESPONSE_DELIVERY", raising=False)
+    monkeypatch.setenv("ENABLE_TELEGRAM_DRAFT_STREAMING", "false")
+
+    assert bot.parse_telegram_response_delivery() == "edit"
+
+    monkeypatch.setenv("ENABLE_TELEGRAM_DRAFT_STREAMING", "true")
+    assert bot.parse_telegram_response_delivery() == "draft"
+
+
+def test_parse_enable_thinking_for_context_prefers_positive_flag(monkeypatch):
+    monkeypatch.setenv("ENABLE_THINKING_FOR_CONTEXT", "true")
+    monkeypatch.setenv("DISABLE_THINKING_FOR_CONTEXT", "true")
+
+    assert bot.parse_enable_thinking_for_context() is True
+
+
+def test_build_chat_completion_payload_disables_thinking_for_context_when_configured(monkeypatch):
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
 
     payload = bot.build_chat_completion_payload(
         [{"role": "user", "content": "요약"}],
@@ -865,8 +893,20 @@ def test_build_chat_completion_payload_disables_thinking_for_context(monkeypatch
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
 
 
+def test_build_chat_completion_payload_keeps_thinking_for_context_by_default(monkeypatch):
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", True)
+
+    payload = bot.build_chat_completion_payload(
+        [{"role": "user", "content": "요약"}],
+        search_context="[Web Article]\n본문",
+    )
+
+    assert payload["stream_options"] == {"include_usage": True}
+    assert "chat_template_kwargs" not in payload
+
+
 def test_build_chat_completion_payload_keeps_server_default_for_plain_chat(monkeypatch):
-    monkeypatch.setattr(bot, "DISABLE_THINKING_FOR_CONTEXT", True)
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
 
     payload = bot.build_chat_completion_payload(
         [{"role": "user", "content": "안녕"}],
@@ -968,7 +1008,7 @@ def test_should_show_reasoning_status_skips_whitespace_and_single_char():
     assert bot.should_show_reasoning_status("계산") is True
 
 
-def test_stream_reply_uses_send_message_draft_then_final_message_by_default(monkeypatch):
+def test_stream_reply_sends_final_message_only_by_default(monkeypatch):
     bot.conversations.clear()
 
     def fake_stream(messages, loop, queue):
@@ -982,6 +1022,7 @@ def test_stream_reply_uses_send_message_draft_then_final_message_by_default(monk
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "final")
 
     dummy_bot = DummyBot()
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
@@ -992,9 +1033,8 @@ def test_stream_reply_uses_send_message_draft_then_final_message_by_default(monk
 
     asyncio.run(bot.stream_reply(update, 321, "질문"))
 
-    assert len(dummy_bot.drafts) >= 1
-    assert dummy_bot.drafts[-1]["text"] == "안녕"
-    assert "안녕" in message.replies
+    assert dummy_bot.drafts == []
+    assert message.replies == ["안녕"]
     assert message.reply_messages[0].edits == []
     assert bot.conversations[session_key(321)][-1] == {"role": "assistant", "content": "안녕"}
 
@@ -1010,6 +1050,7 @@ def test_stream_reply_keeps_first_session_identifier_for_user(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     first_update = SimpleNamespace(
         effective_user=SimpleNamespace(id=900),
@@ -1037,6 +1078,7 @@ def test_stream_reply_keeps_parallel_scoped_sessions_independent(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     first_update = SimpleNamespace(
         effective_user=SimpleNamespace(id=901),
@@ -1067,6 +1109,7 @@ def test_stream_reply_resumes_existing_scoped_session_after_other_scope(monkeypa
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     first_scope = SimpleNamespace(
         effective_user=SimpleNamespace(id=902),
@@ -1107,6 +1150,7 @@ def test_stream_reply_starts_new_in_memory_session_after_idle_prune(monkeypatch)
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
     monkeypatch.setattr(bot, "SESSION_INACTIVE_TTL_SECONDS", 10)
     monkeypatch.setattr(bot.time, "time", lambda: 1000)
 
@@ -1143,6 +1187,7 @@ def test_stream_reply_normalizes_latex_arrow_before_sending(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     dummy_bot = DummyBot()
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
@@ -1177,6 +1222,7 @@ def test_stream_reply_normalizes_markdown_table_before_sending(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     dummy_bot = DummyBot()
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
@@ -1214,6 +1260,7 @@ def test_stream_reply_rewrites_cjk_final_response_before_sending(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     dummy_bot = DummyBot()
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
@@ -1247,6 +1294,7 @@ def test_stream_reply_shows_reasoning_status_before_content(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     dummy_bot = DummyBot()
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
@@ -1264,6 +1312,31 @@ def test_stream_reply_shows_reasoning_status_before_content(monkeypatch):
     assert bot.conversations[session_key(777)][-1] == {"role": "assistant", "content": "323"}
 
 
+def test_stream_reply_final_delivery_hides_reasoning_status(monkeypatch):
+    bot.conversations.clear()
+
+    def fake_stream(messages, loop, queue):
+        loop.call_soon_threadsafe(queue.put_nowait, ("reasoning", "곱셈을 계산한다"))
+        loop.call_soon_threadsafe(queue.put_nowait, ("token", "323"))
+        loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+    monkeypatch.setattr(bot, "_stream_llm_response", fake_stream)
+    use_delivery(monkeypatch, "final")
+
+    dummy_bot = DummyBot()
+    message = DummyMessage(text="질문", bot_instance=dummy_bot)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=779),
+        message=message,
+    )
+
+    asyncio.run(bot.stream_reply(update, 779, "질문"))
+
+    assert dummy_bot.drafts == []
+    assert message.replies == ["323"]
+    assert bot.conversations[session_key(779)][-1] == {"role": "assistant", "content": "323"}
+
+
 def test_stream_reply_skips_reasoning_status_for_trivial_reasoning(monkeypatch):
     bot.conversations.clear()
 
@@ -1278,6 +1351,7 @@ def test_stream_reply_skips_reasoning_status_for_trivial_reasoning(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     dummy_bot = DummyBot()
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
@@ -1308,6 +1382,7 @@ def test_stream_reply_flushes_final_draft_before_sending_message(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     dummy_bot = DummyBot()
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
@@ -1339,6 +1414,7 @@ def test_stream_reply_keeps_draft_mode_after_visible_draft_failure(monkeypatch):
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     dummy_bot = DummyBot(fail_draft_calls={2})
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
@@ -1355,6 +1431,31 @@ def test_stream_reply_keeps_draft_mode_after_visible_draft_failure(monkeypatch):
     assert bot.conversations[session_key(655)][-1] == {"role": "assistant", "content": "테스트"}
 
 
+def test_stream_reply_uses_edit_delivery_when_configured(monkeypatch):
+    def fake_stream(messages, loop, queue):
+        loop.call_soon_threadsafe(queue.put_nowait, ("token", "테"))
+        loop.call_soon_threadsafe(queue.put_nowait, ("token", "스트"))
+        loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+    monkeypatch.setattr(bot, "_stream_llm_response", fake_stream)
+    monkeypatch.setattr(bot, "STREAM_EDIT_INTERVAL", 0)
+    use_delivery(monkeypatch, "edit")
+
+    dummy_bot = DummyBot()
+    message = DummyMessage(text="질문", bot_instance=dummy_bot)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=656),
+        message=message,
+    )
+
+    asyncio.run(bot.stream_reply(update, 656, "질문"))
+
+    assert dummy_bot.drafts == []
+    assert message.replies[0] == "테"
+    assert "테스트" in message.reply_messages[0].edits
+    assert bot.conversations[session_key(656)][-1] == {"role": "assistant", "content": "테스트"}
+
+
 def test_stream_reply_falls_back_to_edit_text_when_draft_fails(monkeypatch):
     def fake_stream(messages, loop, queue):
         loop.call_soon_threadsafe(queue.put_nowait, ("token", "테"))
@@ -1362,12 +1463,12 @@ def test_stream_reply_falls_back_to_edit_text_when_draft_fails(monkeypatch):
         loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
     monkeypatch.setattr(bot, "_stream_llm_response", fake_stream)
-    monkeypatch.setattr(bot, "ENABLE_TELEGRAM_DRAFT_STREAMING", True)
     monkeypatch.setattr(bot, "STREAM_EDIT_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_START_INTERVAL", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_MIN_CHARS_DELTA", 0)
     monkeypatch.setattr(bot, "DRAFT_STREAM_FINAL_FLUSH_DELAY", 0)
+    use_delivery(monkeypatch, "draft")
 
     dummy_bot = DummyBot(fail_draft=True)
     message = DummyMessage(text="질문", bot_instance=dummy_bot)
