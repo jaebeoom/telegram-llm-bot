@@ -199,6 +199,23 @@ def parse_positive_float_env(name: str, default: float) -> float:
     return parsed
 
 
+def parse_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        parsed = int(raw_value.strip())
+    except ValueError:
+        logging.getLogger(__name__).warning("%s must be a positive integer; using default %s", name, default)
+        return default
+
+    if parsed <= 0:
+        logging.getLogger(__name__).warning("%s must be greater than 0; using default %s", name, default)
+        return default
+    return parsed
+
+
 AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS = parse_positive_float_env(
     "AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS",
     12.0,
@@ -206,6 +223,10 @@ AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS = parse_positive_float_env(
 RESPONSE_REWRITE_TIMEOUT_SECONDS = parse_positive_float_env(
     "RESPONSE_REWRITE_TIMEOUT_SECONDS",
     45.0,
+)
+RESPONSE_REWRITE_MAX_ATTEMPTS = parse_positive_int_env(
+    "RESPONSE_REWRITE_MAX_ATTEMPTS",
+    3,
 )
 
 logging.basicConfig(
@@ -951,29 +972,50 @@ def build_response_rewrite_messages(
     user_message: str,
     search_context: str,
     issue: str,
+    attempt: int = 1,
 ) -> list[dict[str, str]]:
     context_note = "The previous answer was based on provided context/search results." if search_context else ""
+    if attempt > 1:
+        system_message = (
+            "You are a Korean translation repair pass. The previous translation still violated output rules. "
+            "Return only the corrected final answer. "
+            "Use Korean plain text only. Do not copy any Chinese Hanzi, Japanese Kanji, Hiragana, or Katakana. "
+            "Use Hangul Korean and Latin technical terms only. "
+            "Do not add apologies or commentary about the translation."
+        )
+        user_instruction = (
+            "Translate the text below into Korean plain text only. "
+            "Do not preserve any Chinese or Japanese characters. "
+            "If a proper noun is written only in Chinese or Japanese, transliterate it into Korean or describe it in Korean."
+        )
+    else:
+        system_message = (
+            "You translate assistant responses into Korean so they comply with output rules. "
+            "Preserve the meaning of the previous answer; do not answer the user request again from scratch. "
+            "Return only the translated final answer. "
+            "Use Korean plain text only. Do not use Chinese or Japanese characters. "
+            "Do not add apologies or commentary about the translation."
+        )
+        user_instruction = (
+            "Translate the previous answer into Korean plain text only. "
+            "Preserve its meaning and structure as much as possible. "
+            "Translate any Chinese or Japanese text into Korean instead of copying it."
+        )
+
     return [
         {
             "role": "system",
-            "content": (
-                "You translate assistant responses into Korean so they comply with output rules. "
-                "Preserve the meaning of the previous answer; do not answer the user request again from scratch. "
-                "Return only the translated final answer. "
-                "Use Korean plain text only. Do not use Chinese or Japanese characters. "
-                "Do not add apologies or commentary about the translation."
-            ),
+            "content": system_message,
         },
         {
             "role": "user",
             "content": (
                 f"Violation: {issue}\n"
+                f"Translation attempt: {attempt}\n"
                 f"{context_note}\n\n"
                 f"Original user request:\n{user_message}\n\n"
                 f"Previous answer:\n{original_text}\n\n"
-                "Translate the previous answer into Korean plain text only. "
-                "Preserve its meaning and structure as much as possible. "
-                "Translate any Chinese or Japanese text into Korean instead of copying it."
+                f"{user_instruction}"
             ).strip(),
         },
     ]
@@ -984,10 +1026,11 @@ def rewrite_invalid_response(
     user_message: str,
     search_context: str,
     issue: str,
+    attempt: int = 1,
 ) -> str:
     payload = {
         "model": MODEL_NAME,
-        "messages": build_response_rewrite_messages(original_text, user_message, search_context, issue),
+        "messages": build_response_rewrite_messages(original_text, user_message, search_context, issue, attempt),
         "stream": False,
         "temperature": 0,
         "chat_template_kwargs": {"enable_thinking": False},
@@ -1023,25 +1066,42 @@ async def validate_and_rewrite_response(
     if issue is None:
         return text
 
-    try:
-        rewritten = await asyncio.to_thread(
-            rewrite_invalid_response,
-            text,
-            user_message,
-            search_context,
-            issue,
+    candidate = text
+    for attempt in range(1, RESPONSE_REWRITE_MAX_ATTEMPTS + 1):
+        try:
+            rewritten = await asyncio.to_thread(
+                rewrite_invalid_response,
+                candidate,
+                user_message,
+                search_context,
+                issue,
+                attempt,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Response translation failed after validation issue=%s attempt=%s/%s: %s",
+                issue,
+                attempt,
+                RESPONSE_REWRITE_MAX_ATTEMPTS,
+                exc,
+            )
+            return RESPONSE_VALIDATION_FAILURE_TEXT
+
+        followup_issue = response_validation_issue(rewritten)
+        if followup_issue is None:
+            logger.info("Response translated after validation issue=%s attempt=%s", issue, attempt)
+            return rewritten
+
+        logger.warning(
+            "Response translation still failed validation issue=%s attempt=%s/%s",
+            followup_issue,
+            attempt,
+            RESPONSE_REWRITE_MAX_ATTEMPTS,
         )
-    except Exception as exc:
-        logger.warning("Response translation failed after validation issue=%s: %s", issue, exc)
-        return RESPONSE_VALIDATION_FAILURE_TEXT
+        candidate = rewritten
+        issue = followup_issue
 
-    followup_issue = response_validation_issue(rewritten)
-    if followup_issue is not None:
-        logger.warning("Response translation still failed validation issue=%s", followup_issue)
-        return RESPONSE_VALIDATION_FAILURE_TEXT
-
-    logger.info("Response translated after validation issue=%s", issue)
-    return rewritten
+    return RESPONSE_VALIDATION_FAILURE_TEXT
 
 
 def build_draft_id() -> int:

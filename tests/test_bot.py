@@ -465,13 +465,43 @@ def test_response_validation_issue_detects_chinese_and_japanese_characters():
     assert bot.response_validation_issue("이 영상은 AI를 설명합니다.") is None
 
 
-def test_validate_and_rewrite_response_uses_fallback_when_translation_still_violates(monkeypatch):
+def test_validate_and_rewrite_response_retries_when_translation_still_violates(monkeypatch):
     monkeypatch.setattr(bot, "ENABLE_RESPONSE_VALIDATION", True)
-    monkeypatch.setattr(bot, "rewrite_invalid_response", lambda *_args: "仍然是中文")
+    monkeypatch.setattr(bot, "RESPONSE_REWRITE_MAX_ATTEMPTS", 3)
+    calls = []
+
+    def fake_rewrite(original_text, user_message, search_context, issue, attempt=1):
+        calls.append((original_text, user_message, search_context, issue, attempt))
+        if attempt == 1:
+            return "仍然是中文"
+        return "이 영상은 AI를 설명합니다."
+
+    monkeypatch.setattr(bot, "rewrite_invalid_response", fake_rewrite)
+
+    result = asyncio.run(bot.validate_and_rewrite_response("这是中文", "요약", "[YouTube Transcript]\n본문"))
+
+    assert result == "이 영상은 AI를 설명합니다."
+    assert calls == [
+        ("这是中文", "요약", "[YouTube Transcript]\n본문", "contains_chinese_or_japanese_characters", 1),
+        ("仍然是中文", "요약", "[YouTube Transcript]\n본문", "contains_chinese_or_japanese_characters", 2),
+    ]
+
+
+def test_validate_and_rewrite_response_uses_fallback_after_max_translation_attempts(monkeypatch):
+    monkeypatch.setattr(bot, "ENABLE_RESPONSE_VALIDATION", True)
+    monkeypatch.setattr(bot, "RESPONSE_REWRITE_MAX_ATTEMPTS", 2)
+    calls = []
+
+    def fake_rewrite(_original_text, _user_message, _search_context, _issue, attempt=1):
+        calls.append(attempt)
+        return "仍然是中文"
+
+    monkeypatch.setattr(bot, "rewrite_invalid_response", fake_rewrite)
 
     result = asyncio.run(bot.validate_and_rewrite_response("这是中文", "요약", "[YouTube Transcript]\n본문"))
 
     assert result == bot.RESPONSE_VALIDATION_FAILURE_TEXT
+    assert calls == [1, 2]
 
 
 def test_normalize_model_name_slugifies_consistently():
@@ -1168,11 +1198,12 @@ def test_stream_reply_rewrites_cjk_final_response_before_sending(monkeypatch):
         loop.call_soon_threadsafe(queue.put_nowait, ("token", "这个视频主要讲的是 AI"))
         loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
-    def fake_rewrite(original_text, user_message, search_context, issue):
+    def fake_rewrite(original_text, user_message, search_context, issue, attempt=1):
         assert original_text == "这个视频主要讲的是 AI"
         assert user_message == "요약"
         assert search_context == "[YouTube Transcript]\n본문"
         assert issue == "contains_chinese_or_japanese_characters"
+        assert attempt == 1
         return "이 영상은 AI를 설명합니다."
 
     monkeypatch.setattr(bot, "_stream_llm_response", fake_stream)
