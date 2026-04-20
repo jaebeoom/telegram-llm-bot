@@ -69,6 +69,7 @@ MODEL_NAME=your_loaded_local_model_name
 VAULT_CAPTURE_PATH=~/path/to/your/Vault/Capture
 INBOX_API_BASE_URL=http://localhost:8000
 INBOX_API_ACCESS_TOKEN=your_inbox_access_token
+INBOX_CONTEXT_SUMMARY_TIMEOUT_SECONDS=45
 ENABLE_RESPONSE_VALIDATION=true
 RESPONSE_REWRITE_TIMEOUT_SECONDS=45
 RESPONSE_REWRITE_MAX_ATTEMPTS=3
@@ -93,6 +94,9 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 | `INBOX_API_BASE_URL` | 기본값 `http://localhost:8000`. `/ctx`가 context source를 가져올 `telegram-inbox-bot` API base URL |
 | `INBOX_API_ACCESS_TOKEN` | Inbox bot의 `ACCESS_TOKEN`이 설정되어 있을 때 같은 값을 넣음. 비어 있으면 Authorization 헤더 없이 호출 |
 | `INBOX_API_TIMEOUT_SECONDS` | 기본값 `10`. Inbox context source API 호출 제한 시간 |
+| `INBOX_CONTEXT_SUMMARY_TIMEOUT_SECONDS` | 기본값 `45`. `/ctx`로 적용한 source의 짧은 확인 요약을 생성하는 LLM 호출 제한 시간 |
+| `INBOX_CONTEXT_SUMMARY_MAX_INPUT_CHARS` | 기본값 `12000`. `/ctx` 확인 요약에 넣을 source 본문 최대 길이 |
+| `INBOX_CONTEXT_PREVIEW_CHARS` | 기본값 `700`. `/ctx` 확인 요약 생성 실패 시 보여줄 본문 미리보기 길이 |
 | `ENABLE_THINKING_FOR_CONTEXT` | 기본값 `false`. URL/PDF/웹검색처럼 컨텍스트를 주입한 요청은 `chat_template_kwargs.enable_thinking=false`로 보내 첫 요약 응답을 더 빠르게 만듦 |
 | `ENABLE_TELEGRAM_DRAFT_STREAMING` | 하위 호환 변수. `TELEGRAM_RESPONSE_DELIVERY`가 없을 때만 읽으며, `true`는 `draft`, `false`는 `edit`로 해석 |
 | `DISABLE_THINKING_FOR_CONTEXT` | 하위 호환 변수. `ENABLE_THINKING_FOR_CONTEXT`가 없을 때만 읽음 |
@@ -221,9 +225,9 @@ YouTube 오디오 전사는 `mlx-community/whisper-large-v3-turbo` 모델을 별
 
 ### Inbox 컨텍스트 큐
 
-`telegram-inbox-bot`에 `/ctx URL` 또는 `URL /ctx`로 넣은 소스는 일반 노트가 아니라 FIFO 컨텍스트 큐에 적재됩니다. 이 봇에서 `/ctx`를 입력하면 Inbox API의 오래된 ready 소스 1개를 가져와 현재 Telegram 세션 source memory에 붙이고, 세션 적용이 성공한 뒤 Inbox 쪽 source를 consumed 처리합니다.
+`telegram-inbox-bot`에 `/ctx URL` 또는 `URL /ctx`로 넣은 소스는 일반 노트가 아니라 FIFO 컨텍스트 큐에 적재됩니다. 이 봇에서 `/ctx`를 입력하면 Inbox API의 오래된 ready 소스 1개를 가져와 현재 Telegram 세션 source memory에 붙이고, 세션 적용이 성공한 뒤 Inbox 쪽 source를 consumed 처리합니다. 적용 응답에는 title, URL, 남은 큐 수, 짧은 한국어 요약이 함께 표시됩니다.
 
-첫 구현은 검색/임베딩 없이 큐 방식으로 동작합니다. 가져온 소스는 `/c`로 세션을 종료하기 전까지 현재 LLM 세션의 활성 컨텍스트로 남습니다.
+첫 구현은 검색/임베딩 없이 큐 방식으로 동작합니다. 가져온 소스는 `/c`로 세션을 종료하기 전까지 현재 LLM 세션의 활성 컨텍스트로 남습니다. 활성 컨텍스트가 있을 때는 일반 후속 질문을 자동 검색보다 source follow-up으로 우선 처리하며, 명시적으로 검색하려면 `/s`를 사용합니다.
 
 ### Vault 저장 형식
 

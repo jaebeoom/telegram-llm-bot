@@ -239,6 +239,44 @@ def test_parse_inbox_context_source_payload():
     )
 
 
+def test_build_inbox_context_applied_reply_includes_summary_and_url():
+    source = bot.InboxContextSource(
+        source_id=7,
+        source_kind="web",
+        source_url="https://example.com/article",
+        title="Article",
+        text="[Web Article]\n본문",
+        remaining_ready_count=3,
+    )
+
+    reply = bot.build_inbox_context_applied_reply(source, "핵심 요약입니다.")
+
+    assert "컨텍스트 적용됨: #7 Article" in reply
+    assert "출처: https://example.com/article" in reply
+    assert "남은 준비된 컨텍스트 큐: 3개" in reply
+    assert "요약\n핵심 요약입니다." in reply
+
+
+def test_resolve_auto_search_decision_skips_classifier_for_active_source_context(monkeypatch):
+    key = session_key(305)
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="영상 제목",
+        text="[YouTube Transcript]\n본문",
+        remaining_ready_count=0,
+    )
+    bot.apply_inbox_context_source_to_session(key, source)
+
+    monkeypatch.setattr(bot, "tavily", object())
+    monkeypatch.setattr(bot, "classify_recency_need", lambda *_args, **_kwargs: pytest.fail("should not classify"))
+
+    decision = bot.resolve_auto_search_decision("방금 넣은 것 무슨 내용인지 요약해줘", key)
+
+    assert decision == bot.AutoSearchDecision(False, reason="active source context", source="source_context")
+
+
 def test_normalize_source_url_canonicalizes_x_and_youtube():
     assert bot.normalize_source_url("https://twitter.com/test/status/12345?ref=share", "x") == (
         "https://x.com/test/status/12345"
@@ -694,6 +732,7 @@ def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
     monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
     monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
+    monkeypatch.setattr(bot, "summarize_inbox_context_source", lambda source: "이 글은 테스트 기사 요약입니다.")
 
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=31),
@@ -708,7 +747,11 @@ def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
     assert bot.source_memories[key][-1].source_url == "https://example.com/article"
     assert key in bot.active_source_sessions
     assert update.message.replies == [
-        "컨텍스트 적용됨: #12 Article\n남은 준비된 컨텍스트 큐: 2개"
+        "컨텍스트 적용됨: #12 Article\n"
+        "출처: https://example.com/article\n"
+        "남은 준비된 컨텍스트 큐: 2개\n\n"
+        "요약\n"
+        "이 글은 테스트 기사 요약입니다."
     ]
 
 

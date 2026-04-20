@@ -326,6 +326,18 @@ YOUTUBE_AUDIO_TRANSCRIPTION_MAX_CONCURRENT = parse_positive_int_env(
     1,
 )
 INBOX_API_TIMEOUT_SECONDS = parse_positive_float_env("INBOX_API_TIMEOUT_SECONDS", 10.0)
+INBOX_CONTEXT_SUMMARY_TIMEOUT_SECONDS = parse_positive_float_env(
+    "INBOX_CONTEXT_SUMMARY_TIMEOUT_SECONDS",
+    45.0,
+)
+INBOX_CONTEXT_SUMMARY_MAX_INPUT_CHARS = parse_positive_int_env(
+    "INBOX_CONTEXT_SUMMARY_MAX_INPUT_CHARS",
+    12_000,
+)
+INBOX_CONTEXT_PREVIEW_CHARS = parse_positive_int_env(
+    "INBOX_CONTEXT_PREVIEW_CHARS",
+    700,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -679,6 +691,8 @@ def resolve_auto_search_decision(
         return AutoSearchDecision(False, reason="auto search disabled", source="disabled")
     if tavily is None:
         return AutoSearchDecision(False, reason="missing TAVILY_API_KEY", source="missing_tavily")
+    if session_key is not None and should_apply_source_followup_rules(session_key, user_message):
+        return AutoSearchDecision(False, reason="active source context", source="source_context")
     if should_force_auto_search(user_message):
         return AutoSearchDecision(True, query=user_message.strip(), reason="explicit recency signal", source="guardrail")
 
@@ -1041,6 +1055,98 @@ def mark_inbox_context_source_consumed(source_id: int) -> None:
         timeout=INBOX_API_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
+
+
+def build_inbox_context_summary_messages(source: InboxContextSource) -> list[dict[str, str]]:
+    title = source.title or SOURCE_KIND_LABELS.get(source.source_kind, "컨텍스트 소스")
+    _, body = strip_context_header(source.text)
+    source_text = (body or source.text).strip()
+    if len(source_text) > INBOX_CONTEXT_SUMMARY_MAX_INPUT_CHARS:
+        source_text = f"{source_text[:INBOX_CONTEXT_SUMMARY_MAX_INPUT_CHARS].rstrip()}\n\n[이하 원문 생략]"
+
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You summarize a newly applied context source for a Telegram user. "
+                "Answer only in Korean. Be concise and concrete. "
+                "Explain what the source is about, then list the core points the user should know. "
+                "Do not use web search or outside knowledge."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"[Source]\n"
+                f"- kind: {source.source_kind}\n"
+                f"- title: {title}\n"
+                f"- url: {source.source_url or '(none)'}\n\n"
+                f"[Content]\n{source_text}\n\n"
+                "이 컨텍스트를 막 세션에 적용했다. 사용자가 맥락을 바로 잡을 수 있게 "
+                "5줄 이내로 요약해줘."
+            ),
+        },
+    ]
+
+
+def summarize_inbox_context_source(source: InboxContextSource) -> str:
+    payload = {
+        "model": MODEL_NAME,
+        "messages": build_inbox_context_summary_messages(source),
+        "stream": False,
+        "temperature": 0.2,
+        "max_tokens": 500,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    response = requests.post(
+        build_chat_completions_url(),
+        headers=build_llm_headers(),
+        json=payload,
+        timeout=INBOX_CONTEXT_SUMMARY_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("summary response missing message content")
+
+    summary = normalize_response_text(str(content))
+    if not summary:
+        raise ValueError("summary response was empty")
+    return summary
+
+
+def build_inbox_context_preview(source: InboxContextSource) -> str:
+    _, body = strip_context_header(source.text)
+    preview = re.sub(r"\s+", " ", (body or source.text).strip())
+    if len(preview) > INBOX_CONTEXT_PREVIEW_CHARS:
+        preview = f"{preview[:INBOX_CONTEXT_PREVIEW_CHARS].rstrip()}..."
+    return preview
+
+
+def build_inbox_context_applied_reply(
+    source: InboxContextSource,
+    summary: str | None = None,
+) -> str:
+    title = source.title or SOURCE_KIND_LABELS.get(source.source_kind, "컨텍스트 소스")
+    lines = [
+        f"컨텍스트 적용됨: #{source.source_id} {title}",
+    ]
+    if source.source_url:
+        lines.append(f"출처: {source.source_url}")
+    lines.append(f"남은 준비된 컨텍스트 큐: {source.remaining_ready_count}개")
+
+    if summary:
+        lines.extend(["", "요약", summary.strip()])
+    else:
+        lines.extend(["", "미리보기", build_inbox_context_preview(source)])
+
+    reply = "\n".join(lines).strip()
+    if len(reply) <= TELEGRAM_TEXT_LIMIT:
+        return reply
+    return f"{reply[: TELEGRAM_TEXT_LIMIT - 3].rstrip()}..."
 
 
 def apply_inbox_context_source_to_session(
@@ -3106,11 +3212,13 @@ async def handle_inbox_context(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    title = source.title or SOURCE_KIND_LABELS.get(source.source_kind, "컨텍스트 소스")
-    await update.message.reply_text(
-        f"컨텍스트 적용됨: #{source.source_id} {title}\n"
-        f"남은 준비된 컨텍스트 큐: {source.remaining_ready_count}개"
-    )
+    summary = None
+    try:
+        summary = await asyncio.to_thread(summarize_inbox_context_source, source)
+    except Exception as exc:
+        logger.warning("Inbox context summary failed source_id=%s: %s", source.source_id, exc)
+
+    await update.message.reply_text(build_inbox_context_applied_reply(source, summary))
 
 
 async def handle_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
