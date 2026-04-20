@@ -1340,6 +1340,76 @@ def test_should_show_reasoning_status_skips_whitespace_and_single_char():
     assert bot.should_show_reasoning_status("계산") is True
 
 
+def test_handle_message_shares_early_typing_indicator_with_stream_reply(monkeypatch):
+    events = []
+    stream_saw_typing = []
+
+    async def fake_keep_typing(update, stop_event):
+        events.append("started")
+        await stop_event.wait()
+        events.append("stopped")
+
+    async def fake_stream_reply(
+        update,
+        user_id,
+        user_message,
+        search_context="",
+        source="context",
+        source_kind=None,
+        source_url=None,
+    ):
+        stream_saw_typing.append(bot._active_typing_indicator.get() is not None)
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "keep_typing_until_visible", fake_keep_typing)
+    monkeypatch.setattr(bot, "resolve_auto_search_decision", lambda *_args, **_kwargs: bot.AutoSearchDecision(False))
+    monkeypatch.setattr(bot, "stream_reply", fake_stream_reply)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=320),
+        message=DummyMessage(text="질문"),
+    )
+
+    asyncio.run(bot.handle_message(update, None))
+
+    assert stream_saw_typing == [True]
+    assert events == ["started", "stopped"]
+
+
+def test_keep_typing_retries_after_transient_chat_action_failure(monkeypatch):
+    class FlakyBot(DummyBot):
+        def __init__(self):
+            super().__init__()
+            self.chat_action_calls = 0
+
+        async def send_chat_action(self, **kwargs):
+            self.chat_action_calls += 1
+            if self.chat_action_calls == 1:
+                raise bot.TelegramError("temporary chat action failure")
+            return await super().send_chat_action(**kwargs)
+
+    async def run_once():
+        flaky_bot = FlakyBot()
+        update = SimpleNamespace(message=DummyMessage(text="질문", bot_instance=flaky_bot))
+        stop_event = asyncio.Event()
+        task = asyncio.create_task(bot.keep_typing_until_visible(update, stop_event))
+        for _ in range(20):
+            if flaky_bot.chat_actions:
+                break
+            await asyncio.sleep(0.01)
+        stop_event.set()
+        await task
+        return flaky_bot
+
+    monkeypatch.setattr(bot, "TYPING_ACTION_RETRY_INTERVAL", 0.01)
+    monkeypatch.setattr(bot, "TYPING_ACTION_INTERVAL", 60)
+
+    flaky_bot = asyncio.run(run_once())
+
+    assert flaky_bot.chat_action_calls >= 2
+    assert flaky_bot.chat_actions[-1]["action"] == bot.ChatAction.TYPING
+
+
 def test_stream_reply_sends_final_message_only_by_default(monkeypatch):
     bot.conversations.clear()
 

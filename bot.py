@@ -10,6 +10,7 @@ import time
 import shutil
 import subprocess
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -173,7 +174,9 @@ DRAFT_STREAM_INTERVAL = 0.9
 DRAFT_STREAM_START_INTERVAL = 0.18
 DRAFT_STREAM_START_CHARS = 80
 DRAFT_STREAM_MIN_CHARS_DELTA = 40
-TYPING_ACTION_INTERVAL = 4.0
+TYPING_ACTION_INTERVAL = 2.5
+TYPING_ACTION_RETRY_INTERVAL = 1.0
+TYPING_ACTION_SEND_TIMEOUT = 3.0
 TELEGRAM_TEXT_LIMIT = 4000
 DEFAULT_CONTEXT_PROMPT = "이 내용을 한국어로 간단히 요약해줘."
 RESPONSE_VALIDATION_FAILURE_TEXT = "⚠️ 응답이 한국어 출력 규칙을 통과하지 못했습니다. 다시 요청해 주세요."
@@ -230,6 +233,18 @@ def parse_enable_thinking_for_context() -> bool:
 
 TELEGRAM_RESPONSE_DELIVERY = parse_telegram_response_delivery()
 ENABLE_THINKING_FOR_CONTEXT = parse_enable_thinking_for_context()
+
+
+@dataclass(frozen=True)
+class TypingIndicator:
+    stop_event: asyncio.Event
+    task: asyncio.Task
+
+
+_active_typing_indicator: ContextVar[TypingIndicator | None] = ContextVar(
+    "active_typing_indicator",
+    default=None,
+)
 ENABLE_AUTO_SEARCH = parse_bool_env("ENABLE_AUTO_SEARCH", True)
 ENABLE_RESPONSE_VALIDATION = parse_bool_env("ENABLE_RESPONSE_VALIDATION", True)
 ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION = parse_bool_env("ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION", False)
@@ -2097,18 +2112,46 @@ async def keep_typing_until_visible(update: Update, stop_event: asyncio.Event):
 
     while not stop_event.is_set():
         try:
-            await message.get_bot().send_chat_action(
-                chat_id=message.chat_id,
-                action=ChatAction.TYPING,
-                message_thread_id=message.message_thread_id,
+            await asyncio.wait_for(
+                message.get_bot().send_chat_action(
+                    chat_id=message.chat_id,
+                    action=ChatAction.TYPING,
+                    message_thread_id=message.message_thread_id,
+                ),
+                timeout=TYPING_ACTION_SEND_TIMEOUT,
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("send_chat_action failed while keeping typing visible; retrying: %s", e)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=TYPING_ACTION_RETRY_INTERVAL)
+            except asyncio.TimeoutError:
+                continue
             return
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=TYPING_ACTION_INTERVAL)
         except asyncio.TimeoutError:
             continue
+
+
+def start_typing_indicator(update: Update) -> TypingIndicator | None:
+    if not update.message:
+        return None
+
+    stop_event = asyncio.Event()
+    return TypingIndicator(
+        stop_event=stop_event,
+        task=asyncio.create_task(keep_typing_until_visible(update, stop_event)),
+    )
+
+
+async def stop_typing_indicator(indicator: TypingIndicator | None):
+    if indicator is None:
+        return
+
+    indicator.stop_event.set()
+    with suppress(Exception):
+        await indicator.task
 
 
 def trim_conversation_history(history: list[ChatMessage]) -> list[ChatMessage]:
@@ -2419,10 +2462,11 @@ async def stream_reply(
     reasoning_used = False
     reasoning_preview = ""
     usage_data: dict | None = None
-    typing_stop_event = asyncio.Event()
+    active_typing_indicator = _active_typing_indicator.get()
+    owns_typing_indicator = active_typing_indicator is None
+    typing_indicator = active_typing_indicator or start_typing_indicator(update)
     queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
     worker = asyncio.create_task(asyncio.to_thread(_stream_llm_response, request_payload, loop, queue))
-    typing_task = asyncio.create_task(keep_typing_until_visible(update, typing_stop_event))
 
     try:
         while True:
@@ -2673,7 +2717,8 @@ async def stream_reply(
     except Exception as e:
         logger.error(f"LLM error: {e}")
         error_text = f"⚠️ {LLM_PROVIDER_NAME} 연결 실패: {e}"
-        typing_stop_event.set()
+        if owns_typing_indicator:
+            await stop_typing_indicator(typing_indicator)
         if reasoning_status_msg is not None:
             with suppress(Exception):
                 await reasoning_status_msg.delete()
@@ -2682,11 +2727,10 @@ async def stream_reply(
         else:
             await update.message.reply_text(error_text)
     finally:
-        typing_stop_event.set()
         with suppress(Exception):
             await worker
-        with suppress(Exception):
-            await typing_task
+        if owns_typing_indicator:
+            await stop_typing_indicator(typing_indicator)
 
 
 
@@ -2755,6 +2799,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
         return
+
+    typing_indicator = start_typing_indicator(update)
+    typing_token = _active_typing_indicator.set(typing_indicator)
+    try:
+        await handle_message_with_typing(
+            update,
+            user_id,
+            current_session_key,
+            user_text,
+        )
+    finally:
+        _active_typing_indicator.reset(typing_token)
+        await stop_typing_indicator(typing_indicator)
+
+
+async def handle_message_with_typing(
+    update: Update,
+    user_id: int,
+    current_session_key: SessionKey | None,
+    user_text: str,
+):
     if current_session_key is not None:
         handled_pending = await handle_pending_youtube_transcription_response(
             update,
