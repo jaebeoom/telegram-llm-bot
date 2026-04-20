@@ -97,6 +97,8 @@ MODEL_NAME = ((os.getenv("OMLX_MODEL") or os.getenv("MODEL_NAME")) or "").strip(
 VAULT_CAPTURE_PATH = (
     os.getenv("VAULT_CAPTURE_PATH") or os.getenv("VAULT_HAIKU_PATH") or ""
 ).strip()
+INBOX_API_BASE_URL = os.getenv("INBOX_API_BASE_URL", "http://localhost:8000").strip().rstrip("/")
+INBOX_API_ACCESS_TOKEN = os.getenv("INBOX_API_ACCESS_TOKEN", "").strip()
 
 
 def parse_session_inactive_ttl_seconds(raw_value: str | None) -> tuple[int | None, str | None]:
@@ -132,6 +134,7 @@ tavily = TavilyClient(api_key=TAVILY_API_KEY) if TAVILY_API_KEY else None
 conversations: dict[SessionKey, list[ChatMessage]] = {}
 session_histories: dict[SessionKey, list[ChatMessage]] = {}
 source_memories: dict[SessionKey, list[SourceMemory]] = {}
+active_source_sessions: set[SessionKey] = set()
 session_identifiers: dict[SessionKey, str] = {}
 last_activity_at_by_session: dict[SessionKey, float] = {}
 pending_youtube_transcriptions: dict[SessionKey, PendingYouTubeTranscription] = {}
@@ -322,6 +325,7 @@ YOUTUBE_AUDIO_TRANSCRIPTION_MAX_CONCURRENT = parse_positive_int_env(
     "YOUTUBE_AUDIO_TRANSCRIPTION_MAX_CONCURRENT",
     1,
 )
+INBOX_API_TIMEOUT_SECONDS = parse_positive_float_env("INBOX_API_TIMEOUT_SECONDS", 10.0)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -505,6 +509,16 @@ class ExtractedContext:
 class ContextExtractionResult:
     matched: bool
     extracted: ExtractedContext | None = None
+
+
+@dataclass(frozen=True)
+class InboxContextSource:
+    source_id: int
+    source_kind: str
+    source_url: str | None
+    title: str
+    text: str
+    remaining_ready_count: int
 
 
 @dataclass(frozen=True)
@@ -958,6 +972,94 @@ def resolve_source_context_for_request(
     return build_retrieved_source_context(memory, user_message), memory.source_kind, memory.source_url, False
 
 
+def build_inbox_api_url(path: str) -> str:
+    if not INBOX_API_BASE_URL:
+        return ""
+    return f"{INBOX_API_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+
+
+def build_inbox_api_headers() -> dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if INBOX_API_ACCESS_TOKEN:
+        headers["Authorization"] = f"Bearer {INBOX_API_ACCESS_TOKEN}"
+    return headers
+
+
+def parse_inbox_context_source_payload(data: dict) -> InboxContextSource | None:
+    source = data.get("source")
+    if source is None:
+        return None
+    if not isinstance(source, dict):
+        raise ValueError("Inbox context source response was malformed.")
+
+    source_id = source.get("id")
+    text = str(source.get("text") or "").strip()
+    source_kind = str(source.get("kind") or "web").strip() or "web"
+    source_url = str(source.get("url") or "").strip() or None
+    title = str(source.get("title") or "").strip()
+    if not isinstance(source_id, int) or not text:
+        raise ValueError("Inbox context source response missed id or text.")
+
+    try:
+        remaining_ready_count = int(data.get("remaining_ready_count") or 0)
+    except (TypeError, ValueError):
+        remaining_ready_count = 0
+
+    return InboxContextSource(
+        source_id=source_id,
+        source_kind=source_kind,
+        source_url=source_url,
+        title=title,
+        text=text,
+        remaining_ready_count=remaining_ready_count,
+    )
+
+
+def fetch_next_inbox_context_source() -> InboxContextSource | None:
+    url = build_inbox_api_url("/api/context-sources/next")
+    if not url:
+        raise ValueError("INBOX_API_BASE_URL is empty.")
+
+    response = requests.get(
+        url,
+        headers=build_inbox_api_headers(),
+        timeout=INBOX_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return parse_inbox_context_source_payload(response.json())
+
+
+def mark_inbox_context_source_consumed(source_id: int) -> None:
+    url = build_inbox_api_url(f"/api/context-sources/{source_id}/consume")
+    if not url:
+        raise ValueError("INBOX_API_BASE_URL is empty.")
+
+    response = requests.post(
+        url,
+        headers=build_inbox_api_headers(),
+        json={"consumer": "telegram-llm-bot"},
+        timeout=INBOX_API_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+
+def apply_inbox_context_source_to_session(
+    session_key: SessionKey,
+    source: InboxContextSource,
+) -> SourceMemory:
+    memory = register_source_memory(
+        session_key,
+        source.text,
+        source.source_kind,
+        source.source_url,
+    )
+    if memory is None:
+        raise ValueError("Inbox context source could not be registered in session memory.")
+    active_source_sessions.add(session_key)
+    touch_session_activity(session_key)
+    return memory
+
+
 def _ensure_url_scheme(url: str) -> str:
     if "://" in url:
         return url
@@ -1205,6 +1307,7 @@ def clear_session_state(session_key: SessionKey) -> None:
     conversations.pop(session_key, None)
     session_histories.pop(session_key, None)
     source_memories.pop(session_key, None)
+    active_source_sessions.discard(session_key)
     session_identifiers.pop(session_key, None)
     last_activity_at_by_session.pop(session_key, None)
     pending_youtube_transcriptions.pop(session_key, None)
@@ -2221,6 +2324,8 @@ def should_apply_source_followup_rules(session_key: SessionKey, user_message: st
         return False
     if GENERAL_URL_PATTERN.search(stripped):
         return False
+    if session_key in active_source_sessions and latest_source_memory(session_key):
+        return True
     if not has_explicit_source_followup_reference(stripped):
         return False
     return has_recent_source_context(session_key)
@@ -2781,6 +2886,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 LLM 봇 준비 완료!\n\n"
         "💬 일반 메시지 → LLM 대화\n"
         "🔍 /s 질문 → 웹 검색 + LLM 답변\n"
+        "📥 /ctx → Inbox 컨텍스트 큐에서 오래된 소스 적용\n"
         "📎 /e URL → LLM 없이 원문 추출\n"
         "🗑️ /c → 대화 기록 초기화 + Vault 저장\n"
         "ℹ️ /m → 현재 모델 확인\n\n"
@@ -2953,6 +3059,60 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await stream_reply(update, user_id, query, search_results, source="search_command")
 
 
+async def handle_inbox_context(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ 접근 권한이 없습니다.")
+        return
+
+    args = " ".join(context.args) if context and context.args else ""
+    if args and args.casefold() != "latest":
+        await update.message.reply_text("사용법: /ctx 또는 /ctx latest")
+        return
+
+    cleanup_inactive_sessions()
+    current_session_key = build_session_key(user_id, update.message)
+    if current_session_key is None:
+        await update.message.reply_text("⚠️ 현재 채팅 세션을 확인하지 못했습니다.")
+        return
+    touch_session_activity(current_session_key)
+    ensure_session_identifier(current_session_key, update.message)
+
+    try:
+        source = await asyncio.to_thread(fetch_next_inbox_context_source)
+    except Exception as exc:
+        logger.error("Inbox context fetch failed: %s", exc)
+        await update.message.reply_text(f"⚠️ Inbox context queue 조회 실패: {exc}")
+        return
+
+    if source is None:
+        await update.message.reply_text("가져올 준비된 컨텍스트가 없어요. Inbox bot에 URL /ctx 로 먼저 넣어두면 됩니다.")
+        return
+
+    try:
+        apply_inbox_context_source_to_session(current_session_key, source)
+    except Exception as exc:
+        logger.error("Inbox context registration failed source_id=%s: %s", source.source_id, exc)
+        await update.message.reply_text(f"⚠️ 컨텍스트를 세션에 적용하지 못했습니다: {exc}")
+        return
+
+    try:
+        await asyncio.to_thread(mark_inbox_context_source_consumed, source.source_id)
+    except Exception as exc:
+        logger.error("Inbox context consume failed source_id=%s: %s", source.source_id, exc)
+        await update.message.reply_text(
+            "컨텍스트는 현재 세션에 적용됐지만 Inbox 큐의 consumed 처리는 실패했습니다.\n"
+            f"source #{source.source_id}: {exc}"
+        )
+        return
+
+    title = source.title or SOURCE_KIND_LABELS.get(source.source_kind, "컨텍스트 소스")
+    await update.message.reply_text(
+        f"컨텍스트 적용됨: #{source.source_id} {title}\n"
+        f"남은 준비된 컨텍스트 큐: {source.remaining_ready_count}개"
+    )
+
+
 async def handle_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_allowed(user_id):
@@ -3081,6 +3241,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("s", handle_search))
     app.add_handler(CommandHandler("search", handle_search))
+    app.add_handler(CommandHandler("ctx", handle_inbox_context))
     app.add_handler(CommandHandler("e", handle_extract))
     app.add_handler(CommandHandler("extract", handle_extract))
     app.add_handler(CommandHandler("raw", handle_extract))

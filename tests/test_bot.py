@@ -18,6 +18,7 @@ def clear_histories():
     bot.conversations.clear()
     bot.session_histories.clear()
     bot.source_memories.clear()
+    bot.active_source_sessions.clear()
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
     bot.pending_youtube_transcriptions.clear()
@@ -26,6 +27,7 @@ def clear_histories():
     bot.conversations.clear()
     bot.session_histories.clear()
     bot.source_memories.clear()
+    bot.active_source_sessions.clear()
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
     bot.pending_youtube_transcriptions.clear()
@@ -193,6 +195,48 @@ def test_source_memory_followup_detection_uses_recent_window():
         bot.append_history_message(key, "assistant", f"일반 답변 {turn}")
 
     assert bot.should_apply_source_followup_rules(key, "이건 어때?") is False
+
+
+def test_active_inbox_context_applies_without_explicit_reference():
+    key = session_key(304)
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="영상 제목",
+        text="[YouTube Transcript]\n본문",
+        remaining_ready_count=0,
+    )
+
+    memory = bot.apply_inbox_context_source_to_session(key, source)
+
+    assert memory.source_kind == "youtube"
+    assert key in bot.active_source_sessions
+    assert bot.should_apply_source_followup_rules(key, "요약해줘") is True
+
+
+def test_parse_inbox_context_source_payload():
+    parsed = bot.parse_inbox_context_source_payload(
+        {
+            "source": {
+                "id": 7,
+                "kind": "web",
+                "title": "Article",
+                "url": "https://example.com/article",
+                "text": "[Web Article]\n본문",
+            },
+            "remaining_ready_count": 3,
+        }
+    )
+
+    assert parsed == bot.InboxContextSource(
+        source_id=7,
+        source_kind="web",
+        source_url="https://example.com/article",
+        title="Article",
+        text="[Web Article]\n본문",
+        remaining_ready_count=3,
+    )
 
 
 def test_normalize_source_url_canonicalizes_x_and_youtube():
@@ -633,6 +677,55 @@ def test_handle_extract_command_returns_web_text_without_llm(monkeypatch):
     assert update.message.replies == [
         "📖 웹페이지 읽는 중...",
         "웹페이지 본문\n\n본문",
+    ]
+
+
+def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
+    consumed = []
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="web",
+        source_url="https://example.com/article",
+        title="Article",
+        text="[Web Article]\n본문",
+        remaining_ready_count=2,
+    )
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
+    monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=31),
+        message=DummyMessage(text="/ctx"),
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.handle_inbox_context(update, context))
+
+    key = session_key(31)
+    assert consumed == [12]
+    assert bot.source_memories[key][-1].source_url == "https://example.com/article"
+    assert key in bot.active_source_sessions
+    assert update.message.replies == [
+        "컨텍스트 적용됨: #12 Article\n남은 준비된 컨텍스트 큐: 2개"
+    ]
+
+
+def test_handle_inbox_context_reports_empty_queue(monkeypatch):
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: None)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=32),
+        message=DummyMessage(text="/ctx"),
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.handle_inbox_context(update, context))
+
+    assert update.message.replies == [
+        "가져올 준비된 컨텍스트가 없어요. Inbox bot에 URL /ctx 로 먼저 넣어두면 됩니다."
     ]
 
 
