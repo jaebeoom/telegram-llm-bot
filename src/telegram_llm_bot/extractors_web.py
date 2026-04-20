@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 _IFRAME_TAG_RE = re.compile(r"<iframe\b[^>]*>", re.IGNORECASE)
 _IFRAME_SRC_RE = re.compile(r'\bsrc=["\']([^"\']+)["\']', re.IGNORECASE)
+_SUBSTACK_APP_POST_PATH_RE = re.compile(r"^/@[^/]+/p-\d+/?$", re.IGNORECASE)
+_SUBSTACK_CANONICAL_URL_RE = re.compile(r'"canonical_url"\s*:\s*"([^"]+)"')
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +71,37 @@ def _extract_iframe_urls(url: str, html: str) -> list[str]:
         ordered_urls.append(iframe_url)
         seen.add(iframe_url)
     return ordered_urls
+
+
+def _is_substack_app_post_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").removeprefix("www.").casefold()
+    return host == "substack.com" and bool(_SUBSTACK_APP_POST_PATH_RE.match(parsed.path))
+
+
+def _substack_canonical_candidate_allowed(candidate: str, original_url: str) -> bool:
+    if candidate == original_url:
+        return False
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    return host == "substack.com" or host.endswith(".substack.com")
+
+
+def _extract_substack_canonical_url(url: str, html: str) -> str | None:
+    if not _is_substack_app_post_url(url):
+        return None
+
+    decoded_html = html.replace(r"\/", "/").replace(r"\"", '"')
+    match = _SUBSTACK_CANONICAL_URL_RE.search(decoded_html)
+    if not match:
+        return None
+
+    candidate = unescape(match.group(1)).strip()
+    if not _substack_canonical_candidate_allowed(candidate, url):
+        return None
+    return candidate
 
 
 def _extract_with_trafilatura(html: str) -> str | None:
@@ -178,6 +211,25 @@ def extract_web_result(url: str) -> WebExtractionResult | None:
             logger.warning("Static web extraction fetch failed for %s: %s", validated_url, exc)
 
         if downloaded:
+            substack_canonical_url = _extract_substack_canonical_url(validated_url, downloaded)
+            if substack_canonical_url:
+                try:
+                    canonical_html = _download_public_url(substack_canonical_url).decode("utf-8", errors="ignore")
+                    result = _extract_web_result_from_html(
+                        substack_canonical_url,
+                        canonical_html,
+                        visited=set(),
+                        stage="static",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Substack canonical extraction fetch failed for %s from %s: %s",
+                        substack_canonical_url,
+                        validated_url,
+                        exc,
+                    )
+
+        if downloaded and not result:
             result = _extract_web_result_from_html(validated_url, downloaded, visited=set(), stage="static")
 
         if not result:

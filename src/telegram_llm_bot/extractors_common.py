@@ -36,6 +36,8 @@ _NOISE_SNIPPETS = (
     "checking if the site connection is secure",
     "verify you are human",
     "enable javascript and cookies to continue",
+    "this site requires javascript to run correctly",
+    "turn on javascript or unblock scripts",
     "attention required!",
     "enable javascript",
     "sign in to x",

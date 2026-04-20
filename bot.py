@@ -149,6 +149,7 @@ YOUTUBE_TRANSCRIPTION_DECLINE_RESPONSES = {"2", "아니요", "no", "n"}
 YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES = {
     "transcripts_disabled",
     "no_transcript_found",
+    "request_blocked",
     "transcript_parse_error",
 }
 
@@ -1840,6 +1841,9 @@ async def extract_context_from_user_text(
                     return ContextExtractionResult(matched=True)
             await update.message.reply_text(f"⚠️ {failure_message}")
             return ContextExtractionResult(matched=True)
+
+        if yt_result.message:
+            await update.message.reply_text(f"ℹ️ {yt_result.message}")
 
         return ContextExtractionResult(
             matched=True,

@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 YOUTUBE_TRANSCRIPT_PREFERRED_LANGUAGES = ("ko", "en")
 YOUTUBE_TRANSCRIPT_FALLBACK_TRANSLATION_LANGUAGE = "ko"
+YOUTUBE_TRANSLATION_BLOCKED_FALLBACK_MESSAGE = (
+    "YouTube가 한국어 번역 자막 요청을 차단해 원본 자막을 사용했습니다."
+)
+YOUTUBE_TRANSLATION_UNAVAILABLE_FALLBACK_MESSAGE = "한국어 번역 자막을 가져오지 못해 원본 자막을 사용했습니다."
 
 
 @dataclass(frozen=True)
@@ -182,6 +186,38 @@ def _format_youtube_transcript_error(exc: Exception) -> tuple[str, str]:
     return ("transcript_error", "YouTube 스크립트를 가져오는 중 오류가 발생했습니다.")
 
 
+def _youtube_language_base(language_code: str | None) -> str:
+    return (language_code or "").strip().lower().split("-", 1)[0]
+
+
+def _youtube_language_matches_preference(language_code: str | None, preferred_language: str) -> bool:
+    normalized_code = (language_code or "").strip().lower()
+    normalized_preference = preferred_language.strip().lower()
+    if not normalized_code or not normalized_preference:
+        return False
+    if normalized_code == normalized_preference:
+        return True
+    if "-" in normalized_preference:
+        return False
+    return _youtube_language_base(normalized_code) == normalized_preference
+
+
+def _is_preferred_youtube_language(language_code: str | None, preferred_languages: tuple[str, ...]) -> bool:
+    return any(_youtube_language_matches_preference(language_code, language) for language in preferred_languages)
+
+
+def _find_locale_compatible_transcript(available, preferred_languages: tuple[str, ...]):
+    for preferred_language in preferred_languages:
+        for is_generated in (False, True):
+            for transcript in available:
+                if transcript.is_generated != is_generated:
+                    continue
+                if _youtube_language_matches_preference(transcript.language_code, preferred_language):
+                    suffix = "generated" if is_generated else "manual"
+                    return transcript, f"preferred_locale_{suffix}"
+    return None
+
+
 def _select_youtube_transcript(transcript_list, preferred_languages: tuple[str, ...]):
     from youtube_transcript_api._errors import NoTranscriptFound
 
@@ -197,6 +233,10 @@ def _select_youtube_transcript(transcript_list, preferred_languages: tuple[str, 
             continue
 
     available = list(transcript_list)
+    locale_match = _find_locale_compatible_transcript(available, preferred_languages)
+    if locale_match is not None:
+        return locale_match
+
     for transcript in available:
         if not transcript.is_generated:
             return transcript, "fallback_manual"
@@ -209,16 +249,30 @@ def _select_youtube_transcript(transcript_list, preferred_languages: tuple[str, 
     )
 
 
-def _translate_youtube_transcript_if_useful(transcript, preferred_languages: tuple[str, ...]):
-    if transcript.language_code in preferred_languages:
-        return transcript, False
+def _youtube_translation_fallback_message(exc: Exception) -> str:
+    status, _message = _format_youtube_transcript_error(exc)
+    if status == "request_blocked":
+        return YOUTUBE_TRANSLATION_BLOCKED_FALLBACK_MESSAGE
+    return YOUTUBE_TRANSLATION_UNAVAILABLE_FALLBACK_MESSAGE
+
+
+def _fetch_youtube_transcript_with_translation_fallback(transcript, preferred_languages: tuple[str, ...]):
+    if _is_preferred_youtube_language(transcript.language_code, preferred_languages):
+        return transcript.fetch(), transcript, False, ""
     if not transcript.is_translatable:
-        return transcript, False
+        return transcript.fetch(), transcript, False, ""
+
     try:
-        return transcript.translate(YOUTUBE_TRANSCRIPT_FALLBACK_TRANSLATION_LANGUAGE), True
+        translated_transcript = transcript.translate(YOUTUBE_TRANSCRIPT_FALLBACK_TRANSLATION_LANGUAGE)
+        return translated_transcript.fetch(), translated_transcript, True, ""
     except Exception as exc:
-        logger.info("YouTube transcript translation unavailable: %s", exc)
-        return transcript, False
+        logger.info("YouTube transcript translation unavailable; falling back to original transcript: %s", exc)
+        fallback_message = _youtube_translation_fallback_message(exc)
+        try:
+            return transcript.fetch(), transcript, False, fallback_message
+        except Exception as fallback_exc:
+            logger.info("Original YouTube transcript fallback failed after translation failure: %s", fallback_exc)
+            raise fallback_exc from exc
 
 
 def extract_youtube_transcript_result(video_id: str) -> YouTubeTranscriptExtractionResult:
@@ -232,14 +286,13 @@ def extract_youtube_transcript_result(video_id: str) -> YouTubeTranscriptExtract
             transcript_list,
             YOUTUBE_TRANSCRIPT_PREFERRED_LANGUAGES,
         )
-        transcript, translated = _translate_youtube_transcript_if_useful(
+        fetched_transcript, transcript, translated, message = _fetch_youtube_transcript_with_translation_fallback(
             transcript,
             YOUTUBE_TRANSCRIPT_PREFERRED_LANGUAGES,
         )
         if translated:
             selection = f"{selection}_translated"
 
-        fetched_transcript = transcript.fetch()
         text = " ".join(s.text for s in fetched_transcript.snippets).strip()
         if not text:
             return YouTubeTranscriptExtractionResult(
@@ -254,7 +307,7 @@ def extract_youtube_transcript_result(video_id: str) -> YouTubeTranscriptExtract
         return YouTubeTranscriptExtractionResult(
             content=f"[YouTube Transcript]\n{text[:MAX_TRANSCRIPT_CHARS]}",
             status="ok",
-            message="",
+            message=message,
             language_code=transcript.language_code,
             language=transcript.language,
             is_generated=transcript.is_generated,

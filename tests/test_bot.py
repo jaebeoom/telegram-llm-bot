@@ -397,6 +397,36 @@ def test_handle_message_with_e_suffix_returns_youtube_transcript_without_llm(mon
     ]
 
 
+def test_handle_message_reports_youtube_transcript_success_notice(monkeypatch):
+    async def fail_stream_reply(*_args, **_kwargs):
+        pytest.fail("extract-only requests should not call the LLM")
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(
+        bot,
+        "extract_youtube_transcript_result",
+        lambda video_id: bot.YouTubeTranscriptExtractionResult(
+            content="[YouTube Transcript]\n원본 영어 자막",
+            status="ok",
+            message="YouTube가 한국어 번역 자막 요청을 차단해 원본 자막을 사용했습니다.",
+        ),
+    )
+    monkeypatch.setattr(bot, "stream_reply", fail_stream_reply)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=25),
+        message=DummyMessage(text="https://youtu.be/abcdefghijk /e"),
+    )
+
+    asyncio.run(bot.handle_message(update, None))
+
+    assert update.message.replies == [
+        "🎬 스크립트 추출 중...",
+        "ℹ️ YouTube가 한국어 번역 자막 요청을 차단해 원본 자막을 사용했습니다.",
+        "YouTube 스크립트\n\n원본 영어 자막",
+    ]
+
+
 def test_handle_message_reports_specific_youtube_transcript_failure(monkeypatch):
     async def fail_stream_reply(*_args, **_kwargs):
         pytest.fail("missing YouTube transcript should not call the LLM")
@@ -482,6 +512,10 @@ def test_handle_message_prompts_for_youtube_audio_transcription_when_enabled(mon
 
 def test_youtube_transcript_parse_error_is_audio_fallback_eligible():
     assert "transcript_parse_error" in bot.YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES
+
+
+def test_youtube_transcript_request_blocked_is_audio_fallback_eligible():
+    assert "request_blocked" in bot.YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES
 
 
 def test_handle_message_accepts_pending_youtube_audio_transcription(monkeypatch):

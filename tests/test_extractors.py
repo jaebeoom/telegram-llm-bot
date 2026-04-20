@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 from concurrent.futures import Future
+from pathlib import Path
 import subprocess
 import sys
 from xml.etree.ElementTree import ParseError
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from extractors import (
     _PlaywrightRenderer,
@@ -12,10 +15,84 @@ from extractors import (
     extract_web_text,
 )
 from extractors_content import _format_youtube_transcript_error
+from extractors_content import (
+    YOUTUBE_TRANSLATION_BLOCKED_FALLBACK_MESSAGE,
+    _select_youtube_transcript,
+    extract_youtube_transcript_result,
+)
+
+
+class FakeTranscript:
+    def __init__(
+        self,
+        language_code: str,
+        *,
+        language: str | None = None,
+        is_generated: bool = False,
+        is_translatable: bool = False,
+        text: str = "transcript text",
+        translated=None,
+        fetch_error: Exception | None = None,
+    ):
+        self.language_code = language_code
+        self.language = language or language_code
+        self.is_generated = is_generated
+        self.is_translatable = is_translatable
+        self.text = text
+        self.translated = translated
+        self.fetch_error = fetch_error
+
+    def fetch(self):
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        return SimpleNamespace(snippets=[SimpleNamespace(text=self.text)])
+
+    def translate(self, language_code: str):
+        assert language_code == "ko"
+        if self.translated is None:
+            raise AssertionError("unexpected translation request")
+        return self.translated
+
+
+class FakeTranscriptList:
+    def __init__(self, transcripts):
+        self.transcripts = transcripts
+
+    def __iter__(self):
+        return iter(self.transcripts)
+
+    def _find(self, language_codes, *, is_generated: bool | None = None):
+        from youtube_transcript_api._errors import NoTranscriptFound
+
+        for transcript in self.transcripts:
+            if is_generated is not None and transcript.is_generated != is_generated:
+                continue
+            if transcript.language_code in language_codes:
+                return transcript
+        raise NoTranscriptFound(
+            video_id="video-id",
+            requested_language_codes=language_codes,
+            transcript_data=self,
+        )
+
+    def find_manually_created_transcript(self, language_codes):
+        return self._find(language_codes, is_generated=False)
+
+    def find_generated_transcript(self, language_codes):
+        return self._find(language_codes, is_generated=True)
+
+    def find_transcript(self, language_codes):
+        return self._find(language_codes)
 
 
 def test_clean_extracted_text_filters_browser_gate_noise():
     text = "You can see a list of supported browsers in our Help Center"
+
+    assert _clean_extracted_text(text, 200) is None
+
+
+def test_clean_extracted_text_filters_substack_js_shell_noise():
+    text = "Home Subscriptions Profile This site requires JavaScript to run correctly. Please turn on JavaScript or unblock scripts"
 
     assert _clean_extracted_text(text, 200) is None
 
@@ -40,6 +117,45 @@ def test_youtube_transcript_parse_error_reports_specific_status():
 
     assert status == "transcript_parse_error"
     assert message == "공개 자막 데이터가 깨져서 읽을 수 없습니다."
+
+
+def test_youtube_transcript_selection_accepts_locale_variant_for_base_language():
+    transcript = FakeTranscript("en-US", language="English (United States)")
+    transcript_list = FakeTranscriptList([transcript])
+
+    selected, selection = _select_youtube_transcript(transcript_list, ("ko", "en"))
+
+    assert selected is transcript
+    assert selection == "preferred_locale_manual"
+
+
+def test_youtube_transcript_uses_original_when_translation_fetch_is_blocked(monkeypatch):
+    import youtube_transcript_api
+    from youtube_transcript_api._errors import IpBlocked
+
+    translated = FakeTranscript("ko", language="Korean", fetch_error=IpBlocked("video-id"))
+    original = FakeTranscript(
+        "es",
+        language="Spanish",
+        is_translatable=True,
+        text="original transcript",
+        translated=translated,
+    )
+
+    class FakeApi:
+        def list(self, video_id):
+            assert video_id == "video-id"
+            return FakeTranscriptList([original])
+
+    monkeypatch.setattr(youtube_transcript_api, "YouTubeTranscriptApi", FakeApi)
+
+    result = extract_youtube_transcript_result("video-id")
+
+    assert result.status == "ok"
+    assert result.message == YOUTUBE_TRANSLATION_BLOCKED_FALLBACK_MESSAGE
+    assert result.language_code == "es"
+    assert result.selection == "fallback_manual"
+    assert result.content == "[YouTube Transcript]\noriginal transcript"
 
 
 def test_extract_web_text_follows_iframe_when_outer_page_has_no_article(monkeypatch):
@@ -137,6 +253,44 @@ def test_extract_web_result_reports_static_readability_method(monkeypatch):
     assert result.method == "static_readability"
     assert result.document_url == url
     assert result.content == f"[Web Article]\nURL: {url}\n\n정리된 본문"
+
+
+def test_extract_web_result_follows_substack_app_route_canonical_url(monkeypatch):
+    app_url = "https://substack.com/@writer/p-123"
+    canonical_url = "https://writer.substack.com/p/post-title"
+    downloaded_urls: list[str] = []
+
+    def fake_download(url: str) -> bytes:
+        downloaded_urls.append(url)
+        if url == app_url:
+            return (
+                '<div>Home Subscriptions Profile This site requires JavaScript to run correctly. '
+                'Please turn on JavaScript or unblock scripts</div>'
+                '<script>{\\"canonical_url\\":\\"https://writer.substack.com/p/post-title\\"}</script>'
+            ).encode("utf-8")
+        if url == canonical_url:
+            return "<article><h1>Actual article</h1><p>실제 글 본문</p></article>".encode("utf-8")
+        raise AssertionError(f"unexpected url: {url}")
+
+    def fake_extract(html: str) -> str | None:
+        if "Actual article" in html:
+            return "Actual article\n실제 글 본문"
+        if "This site requires JavaScript" in html:
+            return "Home Subscriptions Profile This site requires JavaScript to run correctly"
+        return None
+
+    monkeypatch.setattr("extractors_web._download_public_url", fake_download)
+    monkeypatch.setattr("extractors_web._validate_public_url", lambda url: url)
+    monkeypatch.setattr("extractors_web._extract_with_trafilatura", fake_extract)
+    monkeypatch.setattr("extractors_web._extract_rendered_web_result", lambda url: None)
+
+    result = extract_web_result(app_url)
+
+    assert downloaded_urls == [app_url, canonical_url]
+    assert result is not None
+    assert result.document_url == canonical_url
+    assert result.method == "static_trafilatura"
+    assert result.content == f"[Web Article]\nURL: {app_url}\n\nActual article\n실제 글 본문"
 
 
 def test_playwright_route_aborts_private_requests(monkeypatch):
