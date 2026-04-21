@@ -60,7 +60,7 @@ TELEGRAM_TOKEN=your_telegram_bot_token
 TAVILY_API_KEY=your_tavily_api_key
 ENABLE_AUTO_SEARCH=true
 TELEGRAM_RESPONSE_DELIVERY=final
-ENABLE_THINKING_FOR_CONTEXT=false
+ENABLE_THINKING_FOR_CONTEXT=true
 LLM_API_BASE_URL=http://127.0.0.1:8001/v1
 LLM_API_KEY=omlx
 LLM_PROVIDER_NAME=OMLX
@@ -97,7 +97,7 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 | `INBOX_CONTEXT_SUMMARY_TIMEOUT_SECONDS` | 기본값 `45`. 하위 호환용 `/ctx` 짧은 요약 helper 제한 시간. 현재 기본 `/ctx` 응답은 직접 URL과 같은 streaming context 경로 사용 |
 | `INBOX_CONTEXT_SUMMARY_MAX_INPUT_CHARS` | 기본값 `12000`. 하위 호환용 `/ctx` 짧은 요약 helper 입력 제한 |
 | `INBOX_CONTEXT_PREVIEW_CHARS` | 기본값 `700`. `/ctx` preview helper가 본문 미리보기를 만들 때의 길이 제한 |
-| `ENABLE_THINKING_FOR_CONTEXT` | 기본값 `false`. URL/PDF/웹검색처럼 컨텍스트를 주입한 요청은 `chat_template_kwargs.enable_thinking=false`로 보내 첫 요약 응답을 더 빠르게 만듦 |
+| `ENABLE_THINKING_FOR_CONTEXT` | 기본값 `true`. URL/PDF/웹검색/Inbox 컨텍스트를 주입한 답변도 서버 기본 reasoning을 유지함 |
 | `ENABLE_TELEGRAM_DRAFT_STREAMING` | 하위 호환 변수. `TELEGRAM_RESPONSE_DELIVERY`가 없을 때만 읽으며, `true`는 `draft`, `false`는 `edit`로 해석 |
 | `DISABLE_THINKING_FOR_CONTEXT` | 하위 호환 변수. `ENABLE_THINKING_FOR_CONTEXT`가 없을 때만 읽음 |
 | `ENABLE_RESPONSE_VALIDATION` | 기본값 `true`. 최종 LLM 답변에 중국어/일본어 문자가 포함되면 전송 직전에 한국어 번역 pass를 수행 |
@@ -126,7 +126,7 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 샘플링 관련 값(`temperature`, `max_tokens`, `top_p` 등)은 봇이 별도로 덮어쓰지 않고 OMLX 같은 서버 쪽 설정을 그대로 따릅니다.
 `TELEGRAM_RESPONSE_DELIVERY=final`은 최종 답변을 새 메시지로 보내며, reasoning token이 감지되면 임시 `🧠 추론 중...` 메시지를 보냈다가 최종 답변 전송 후 삭제합니다. 내부 LLM 응답은 계속 스트리밍으로 읽어 timeout, usage, reasoning 메트릭을 유지합니다.
 모바일에서 네이티브 draft 스트리밍을 다시 쓰고 싶다면 `TELEGRAM_RESPONSE_DELIVERY=draft`, 단일 메시지 편집 스트리밍을 쓰고 싶다면 `TELEGRAM_RESPONSE_DELIVERY=edit`로 바꿀 수 있습니다.
-컨텍스트 주입 답변도 서버 기본 reasoning을 유지하고 싶다면 `ENABLE_THINKING_FOR_CONTEXT=true`로 바꿀 수 있습니다.
+컨텍스트 주입 답변 속도를 우선해 reasoning을 끄고 싶다면 `ENABLE_THINKING_FOR_CONTEXT=false`로 바꿀 수 있습니다.
 자동 검색은 명시적인 최신성 신호가 있으면 바로 검색하고, 그 외 일반 메시지는 로컬 LLM에 짧은 분류 요청을 보내 `needs_search=true`일 때만 검색합니다. `TAVILY_API_KEY`가 없으면 자동 검색도 비활성화됩니다.
 Playwright fallback을 쓰려면 Python 패키지 설치 외에 `uv run playwright install chromium`도 한 번 실행해야 합니다.
 YouTube 오디오 전사 fallback을 쓰려면 시스템에 `ffmpeg`와 `ffprobe`가 있어야 합니다. macOS에서는 `brew install ffmpeg`로 함께 설치됩니다.

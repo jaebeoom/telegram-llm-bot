@@ -1798,9 +1798,16 @@ def test_parse_enable_thinking_for_context_prefers_positive_flag(monkeypatch):
     assert bot.parse_enable_thinking_for_context() is True
 
 
-def test_parse_enable_thinking_for_context_defaults_to_disabled(monkeypatch):
+def test_parse_enable_thinking_for_context_defaults_to_enabled(monkeypatch):
     monkeypatch.delenv("ENABLE_THINKING_FOR_CONTEXT", raising=False)
     monkeypatch.delenv("DISABLE_THINKING_FOR_CONTEXT", raising=False)
+
+    assert bot.parse_enable_thinking_for_context() is True
+
+
+def test_parse_enable_thinking_for_context_honors_legacy_disable(monkeypatch):
+    monkeypatch.delenv("ENABLE_THINKING_FOR_CONTEXT", raising=False)
+    monkeypatch.setenv("DISABLE_THINKING_FOR_CONTEXT", "true")
 
     assert bot.parse_enable_thinking_for_context() is False
 
