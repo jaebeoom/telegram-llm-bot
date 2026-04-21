@@ -1,6 +1,7 @@
 import asyncio
 import re
 import sys
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -133,7 +134,7 @@ def test_build_context_prompt_keeps_user_text():
     assert bot.build_context_prompt("요약 말고 핵심만") == "요약 말고 핵심만"
 
 
-def test_long_source_context_is_chunked_and_retrieved_representatively():
+def test_direct_long_source_context_uses_legacy_full_context():
     key = session_key(301)
     long_context = "[Web Article]\n" + "첫 구간 성장 서술. " * 900 + "중간 구간 비용 압박. " * 900
 
@@ -145,13 +146,87 @@ def test_long_source_context_is_chunked_and_retrieved_representatively():
         source_url="https://example.com/article",
     )
 
+    assert effective_context == long_context
+    assert source_kind == "web"
+    assert source_url == "https://example.com/article"
+    assert store_context is True
+    assert bot.source_memories.get(key) is None
+
+
+def test_direct_context_replaces_active_inbox_context_mode():
+    key = session_key(301)
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="web",
+        source_url="https://example.com/inbox",
+        title="Inbox Article",
+        text="[Web Article]\nInbox 본문",
+        remaining_ready_count=0,
+    )
+    bot.apply_inbox_context_source_to_session(key, source)
+
+    effective_context, source_kind, source_url, store_context = bot.resolve_source_context_for_request(
+        key,
+        bot.DEFAULT_CONTEXT_PROMPT,
+        "[Web Article]\n직접 보낸 본문",
+        source_kind="web",
+        source_url="https://example.com/direct",
+    )
+
+    assert effective_context == "[Web Article]\n직접 보낸 본문"
+    assert source_kind == "web"
+    assert source_url == "https://example.com/direct"
+    assert store_context is True
+    assert key not in bot.active_source_sessions
+
+
+def test_inbox_initial_source_context_uses_full_context_while_registering_memory():
+    key = session_key(301)
+    long_context = "[Web Article]\n" + "첫 구간 성장 서술. " * 900 + "중간 구간 비용 압박. " * 900
+
+    effective_context, source_kind, source_url, store_context = bot.resolve_source_context_for_request(
+        key,
+        bot.DEFAULT_CONTEXT_PROMPT,
+        long_context,
+        source_kind="web",
+        source_url="https://example.com/article",
+        use_source_memory_for_context=True,
+    )
+
+    assert effective_context == long_context
+    assert source_kind == "web"
+    assert source_url == "https://example.com/article"
+    assert store_context is True
+    assert bot.source_memories[key][-1].content == long_context.strip()
+    assert key in bot.active_source_sessions
+
+
+def test_inbox_source_context_is_chunked_and_retrieved_representatively():
+    key = session_key(301)
+    long_context = "[Web Article]\n" + "첫 구간 성장 서술. " * 900 + "중간 구간 비용 압박. " * 900
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="web",
+        source_url="https://example.com/article",
+        title="Article",
+        text=long_context,
+        remaining_ready_count=0,
+    )
+
+    bot.apply_inbox_context_source_to_session(key, source)
+    effective_context, source_kind, source_url, store_context = bot.resolve_source_context_for_request(
+        key,
+        bot.DEFAULT_CONTEXT_PROMPT,
+        "",
+    )
+
     assert effective_context.startswith("[Retrieved Source Context]")
     assert "Selection mode: representative" in effective_context
     assert "Chunks selected:" in effective_context
     assert len(effective_context) < len(long_context)
     assert source_kind == "web"
     assert source_url == "https://example.com/article"
-    assert store_context is True
+    assert store_context is False
     assert bot.source_memories[key][-1].content == long_context.strip()
 
 
@@ -164,7 +239,15 @@ def test_source_followup_retrieves_relevant_chunk_without_storing_retrieval_prom
         + "수요 신호는 재고 회전, 예약 주문, 기업 고객 전환율에서 확인된다. " * 80
         + "후반부 비용 구조와 리스크. " * 800
     )
-    bot.register_source_memory(key, long_context, "web", "https://example.com/article")
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="web",
+        source_url="https://example.com/article",
+        title="Article",
+        text=long_context,
+        remaining_ready_count=0,
+    )
+    bot.apply_inbox_context_source_to_session(key, source)
 
     effective_context, source_kind, source_url, store_context = bot.resolve_source_context_for_request(
         key,
@@ -187,9 +270,14 @@ def test_source_followup_retrieves_relevant_chunk_without_storing_retrieval_prom
     assert bot.session_histories[key][-1]["source_url"] == "https://example.com/article"
 
 
-def test_source_memory_followup_detection_uses_recent_window():
+def test_legacy_source_followup_detection_uses_recent_window():
     key = session_key(303)
-    bot.register_source_memory(key, "[Web Article]\n본문", "web", "https://example.com/article")
+    bot.append_history_message(
+        key,
+        "user",
+        "[Web Article]\n본문\n\n[Response Rules]\n...\n\n[User Question]\n요약",
+    )
+    bot.append_history_message(key, "assistant", "첫 요약")
     for turn in range(5):
         bot.append_history_message(key, "user", f"일반 질문 {turn}")
         bot.append_history_message(key, "assistant", f"일반 답변 {turn}")
@@ -275,6 +363,32 @@ def test_resolve_auto_search_decision_skips_classifier_for_active_source_context
     decision = bot.resolve_auto_search_decision("방금 넣은 것 무슨 내용인지 요약해줘", key)
 
     assert decision == bot.AutoSearchDecision(False, reason="active source context", source="source_context")
+
+
+def test_resolve_auto_search_decision_uses_classifier_for_regular_context_followup(monkeypatch):
+    key = session_key(306)
+    bot.conversations[key] = [
+        {
+            "role": "user",
+            "content": "[Web Article]\n원문\n\n[Response Rules]\n...\n\n[User Question]\n요약",
+        },
+        {"role": "assistant", "content": "첫 요약"},
+    ]
+
+    monkeypatch.setattr(bot, "tavily", object())
+    monkeypatch.setattr(
+        bot,
+        "classify_recency_need",
+        lambda user_message, session_key=None: bot.AutoSearchDecision(
+            False,
+            reason="classifier checked",
+            source="classifier",
+        ),
+    )
+
+    decision = bot.resolve_auto_search_decision("수요 신호만", key)
+
+    assert decision == bot.AutoSearchDecision(False, reason="classifier checked", source="classifier")
 
 
 def test_normalize_source_url_canonicalizes_x_and_youtube():
@@ -661,6 +775,158 @@ def test_handle_message_accepts_pending_youtube_audio_transcription(monkeypatch)
     ]
 
 
+def test_handle_message_reports_pending_youtube_audio_transcription_failure(monkeypatch):
+    async def fake_worker(update, pending):
+        return {
+            "ok": False,
+            "status": "stalled",
+            "message": "마지막 진행: 6/8",
+        }
+
+    key = session_key(25)
+    bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
+        video_id="abcdefghijk",
+        youtube_url="https://youtu.be/abcdefghijk",
+        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        user_message="요약",
+        extract_only_requested=False,
+        requested_at=bot.time.time(),
+        failure_status="transcripts_disabled",
+        failure_message="자막 비활성화",
+    )
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "run_youtube_audio_transcription_worker", fake_worker)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=25),
+        message=DummyMessage(text="1"),
+    )
+
+    asyncio.run(bot.handle_message(update, None))
+
+    assert key not in bot.pending_youtube_transcriptions
+    assert update.message.replies == [
+        "🎙️ 오디오 전사를 시작할게요.",
+        "⚠️ 오디오 전사를 완료하지 못했습니다.\n상태: stalled\n사유: 마지막 진행: 6/8",
+    ]
+
+
+def test_handle_message_reports_pending_youtube_audio_transcription_exception(monkeypatch):
+    async def fake_worker(update, pending):
+        raise RuntimeError("stdout line exceeds stream limit")
+
+    key = session_key(26)
+    bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
+        video_id="abcdefghijk",
+        youtube_url="https://youtu.be/abcdefghijk",
+        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        user_message="요약",
+        extract_only_requested=False,
+        requested_at=bot.time.time(),
+        failure_status="transcripts_disabled",
+        failure_message="자막 비활성화",
+    )
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "run_youtube_audio_transcription_worker", fake_worker)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=26),
+        message=DummyMessage(text="1"),
+    )
+
+    asyncio.run(bot.handle_message(update, None))
+
+    assert key not in bot.pending_youtube_transcriptions
+    assert update.message.replies == [
+        "🎙️ 오디오 전사를 시작할게요.",
+        "⚠️ 오디오 전사를 완료하지 못했습니다.\n"
+        "상태: worker_exception\n"
+        "사유: stdout line exceeds stream limit",
+    ]
+
+
+def test_run_youtube_audio_transcription_worker_reads_large_final_payload(monkeypatch):
+    script = (
+        "import json\n"
+        "print(json.dumps({'ok': True, 'status': 'ok', 'message': 'transcribed', 'content': '가' * 120000}), flush=True)\n"
+    )
+    pending = bot.PendingYouTubeTranscription(
+        video_id="abcdefghijk",
+        youtube_url="https://youtu.be/abcdefghijk",
+        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        user_message="요약",
+        extract_only_requested=False,
+        requested_at=bot.time.time(),
+        failure_status="transcripts_disabled",
+        failure_message="자막 비활성화",
+    )
+    monkeypatch.setattr(bot, "youtube_audio_worker_command", lambda *_args: [sys.executable, "-c", script])
+    monkeypatch.setattr(bot, "YOUTUBE_AUDIO_TRANSCRIPTION_IDLE_TIMEOUT_SECONDS", 2)
+
+    update = SimpleNamespace(message=DummyMessage(text="1"))
+
+    result = asyncio.run(bot.run_youtube_audio_transcription_worker(update, pending))
+
+    assert result["status"] == "ok"
+    assert len(result["content"]) == 120000
+
+
+def test_run_youtube_audio_transcription_worker_drains_stderr(monkeypatch):
+    script = (
+        "import json, sys\n"
+        "sys.stderr.write('x' * 200000)\n"
+        "sys.stderr.flush()\n"
+        "print(json.dumps({'ok': False, 'status': 'error', 'message': 'worker failed'}), flush=True)\n"
+    )
+    pending = bot.PendingYouTubeTranscription(
+        video_id="abcdefghijk",
+        youtube_url="https://youtu.be/abcdefghijk",
+        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        user_message="요약",
+        extract_only_requested=False,
+        requested_at=bot.time.time(),
+        failure_status="transcripts_disabled",
+        failure_message="자막 비활성화",
+    )
+    monkeypatch.setattr(bot, "youtube_audio_worker_command", lambda *_args: [sys.executable, "-c", script])
+    monkeypatch.setattr(bot, "YOUTUBE_AUDIO_TRANSCRIPTION_IDLE_TIMEOUT_SECONDS", 2)
+
+    update = SimpleNamespace(message=DummyMessage(text="1"))
+
+    result = asyncio.run(bot.run_youtube_audio_transcription_worker(update, pending))
+
+    assert result["status"] == "error"
+    assert result["message"] == "worker failed"
+
+
+def test_run_youtube_audio_transcription_worker_reports_stall(monkeypatch):
+    script = (
+        "import json, time\n"
+        "print(json.dumps({'event': 'chunk_done', 'video_id': 'abcdefghijk', 'index': 6, 'total': 8}), flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    pending = bot.PendingYouTubeTranscription(
+        video_id="abcdefghijk",
+        youtube_url="https://youtu.be/abcdefghijk",
+        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
+        user_message="요약",
+        extract_only_requested=False,
+        requested_at=bot.time.time(),
+        failure_status="transcripts_disabled",
+        failure_message="자막 비활성화",
+    )
+    monkeypatch.setattr(bot, "youtube_audio_worker_command", lambda *_args: [sys.executable, "-c", script])
+    monkeypatch.setattr(bot, "YOUTUBE_AUDIO_TRANSCRIPTION_IDLE_TIMEOUT_SECONDS", 0.05)
+
+    update = SimpleNamespace(message=DummyMessage(text="1"))
+
+    result = asyncio.run(bot.run_youtube_audio_transcription_worker(update, pending))
+
+    assert result["status"] == "stalled"
+    assert "마지막 진행: 6/8" in result["message"]
+    assert update.message.replies == ["🎙️ 오디오 전사 진행 중... 6/8"]
+
+
 def test_handle_message_rejects_ambiguous_youtube_audio_confirmation(monkeypatch):
     key = session_key(24)
     bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
@@ -720,6 +986,7 @@ def test_handle_extract_command_returns_web_text_without_llm(monkeypatch):
 
 def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
     consumed = []
+    stream_calls = []
     source = bot.InboxContextSource(
         source_id=12,
         source_kind="web",
@@ -729,10 +996,13 @@ def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
         remaining_ready_count=2,
     )
 
+    async def fake_stream_context_reply(update, user_id, user_message, search_context, **kwargs):
+        stream_calls.append((user_id, user_message, search_context, kwargs))
+
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
     monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
     monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
-    monkeypatch.setattr(bot, "summarize_inbox_context_source", lambda source: "이 글은 테스트 기사 요약입니다.")
+    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
 
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=31),
@@ -746,12 +1016,18 @@ def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
     assert consumed == [12]
     assert bot.source_memories[key][-1].source_url == "https://example.com/article"
     assert key in bot.active_source_sessions
-    assert update.message.replies == [
-        "컨텍스트 적용됨: #12 Article\n"
-        "출처: https://example.com/article\n"
-        "남은 준비된 컨텍스트 큐: 2개\n\n"
-        "요약\n"
-        "이 글은 테스트 기사 요약입니다."
+    assert update.message.replies == [bot.build_inbox_context_status_reply(source)]
+    assert stream_calls == [
+        (
+            31,
+            bot.DEFAULT_CONTEXT_PROMPT,
+            "[Web Article]\n본문",
+            {
+                "source": "inbox_context",
+                "source_kind": "web",
+                "source_url": "https://example.com/article",
+            },
+        )
     ]
 
 
@@ -770,6 +1046,150 @@ def test_handle_inbox_context_reports_empty_queue(monkeypatch):
     assert update.message.replies == [
         "가져올 준비된 컨텍스트가 없어요. Inbox bot에 URL /ctx 로 먼저 넣어두면 됩니다."
     ]
+
+
+def test_handle_inbox_context_keeps_typing_visible_while_waiting(monkeypatch):
+    events = []
+    consumed = []
+    stream_calls = []
+    source = bot.InboxContextSource(
+        source_id=13,
+        source_kind="web",
+        source_url="https://example.com/article",
+        title="Article",
+        text="[Web Article]\n본문",
+        remaining_ready_count=0,
+    )
+
+    async def fake_keep_typing(update, stop_event):
+        events.append("started")
+        await stop_event.wait()
+        events.append("stopped")
+
+    def slow_fetch():
+        time.sleep(0.01)
+        return source
+
+    async def fake_stream_context_reply(update, user_id, user_message, search_context, **kwargs):
+        stream_calls.append((user_id, user_message, search_context, kwargs))
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "keep_typing_until_visible", fake_keep_typing)
+    monkeypatch.setattr(bot, "fetch_next_inbox_context_source", slow_fetch)
+    monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
+    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=33),
+        message=DummyMessage(text="/ctx"),
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.handle_inbox_context(update, context))
+
+    assert events == ["started", "stopped"]
+    assert consumed == [13]
+    assert update.message.replies == [bot.build_inbox_context_status_reply(source)]
+    assert stream_calls
+
+
+def test_handle_inbox_context_enhances_youtube_with_audio_fallback(monkeypatch):
+    consumed = []
+    stream_calls = []
+    source = bot.InboxContextSource(
+        source_id=14,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n짧은 inbox 본문",
+        remaining_ready_count=1,
+    )
+
+    def fake_build_pending(video_id, youtube_url, canonical_url, user_message, extract_only, yt_result):
+        assert video_id == "abcdefghijk"
+        assert canonical_url == "https://www.youtube.com/watch?v=abcdefghijk"
+        assert user_message == bot.DEFAULT_CONTEXT_PROMPT
+        assert extract_only is False
+        assert yt_result.status == "request_blocked"
+        return (
+            bot.PendingYouTubeTranscription(
+                video_id=video_id,
+                youtube_url=youtube_url,
+                canonical_youtube_url=canonical_url,
+                user_message=user_message,
+                extract_only_requested=False,
+                requested_at=bot.time.time(),
+                failure_status=yt_result.status,
+                failure_message=yt_result.message,
+            ),
+            None,
+        )
+
+    async def fake_execute_youtube_audio_transcription(update, pending):
+        return (
+            {
+                "ok": True,
+                "status": "ok",
+                "message": "transcribed",
+                "content": "[YouTube Transcript]\n긴 오디오 전사 본문",
+            },
+            1234,
+        )
+
+    async def fake_stream_context_reply(update, user_id, user_message, search_context, **kwargs):
+        stream_calls.append((user_id, user_message, search_context, kwargs))
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
+    monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
+    monkeypatch.setattr(
+        bot,
+        "extract_youtube_transcript_result",
+        lambda video_id: bot.YouTubeTranscriptExtractionResult(
+            content=None,
+            status="request_blocked",
+            message="YouTube가 현재 스크립트 요청을 차단했습니다.",
+        ),
+    )
+    monkeypatch.setattr(bot, "build_pending_youtube_transcription", fake_build_pending)
+    monkeypatch.setattr(bot, "execute_youtube_audio_transcription", fake_execute_youtube_audio_transcription)
+    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=34),
+        message=DummyMessage(text="/ctx"),
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.handle_inbox_context(update, context))
+
+    enhanced_source = bot.InboxContextSource(
+        source_id=14,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n긴 오디오 전사 본문",
+        remaining_ready_count=1,
+    )
+    assert consumed == [14]
+    assert update.message.replies == [
+        "🎬 Inbox YouTube 컨텍스트를 직접 URL 경로로 다시 추출 중...",
+        "🎙️ 공개 자막이 막혀 Inbox YouTube 컨텍스트를 오디오 전사로 보강합니다.",
+        bot.build_inbox_context_status_reply(enhanced_source, enhanced=True),
+    ]
+    assert stream_calls == [
+        (
+            34,
+            bot.DEFAULT_CONTEXT_PROMPT,
+            "[YouTube Transcript]\n긴 오디오 전사 본문",
+            {
+                "source": "inbox_context",
+                "source_kind": "youtube",
+                "source_url": "https://www.youtube.com/watch?v=abcdefghijk",
+            },
+        )
+    ]
+    assert bot.source_memories[session_key(34)][-1].content == "[YouTube Transcript]\n긴 오디오 전사 본문"
 
 
 def test_handle_e_command_returns_web_text_without_llm(monkeypatch):
@@ -1250,7 +1670,7 @@ def test_prepare_messages_applies_source_followup_rules_without_storing_them(mon
     assert bot.session_histories[key][-1] == {"role": "user", "content": "이 자료에서 수요 신호만"}
 
 
-def test_prepare_messages_skips_source_followup_rules_without_explicit_source_reference(monkeypatch):
+def test_prepare_messages_applies_legacy_source_followup_without_explicit_source_reference(monkeypatch):
     monkeypatch.setattr(bot, "build_system_prompt", lambda model_name: "prompt")
     key = session_key(424)
     bot.conversations[key] = [
@@ -1264,8 +1684,10 @@ def test_prepare_messages_skips_source_followup_rules_without_explicit_source_re
 
     messages = bot.prepare_messages(key, "수요 신호만")
 
-    assert messages[-1] == {"role": "user", "content": "수요 신호만"}
-    assert "[Follow-up Source Rules]" not in messages[-1]["content"]
+    assert messages[-1]["role"] == "user"
+    assert "[Follow-up Source Rules]" in messages[-1]["content"]
+    assert "[User Question]\n수요 신호만" in messages[-1]["content"]
+    assert bot.conversations[key][-1] == {"role": "user", "content": "수요 신호만"}
 
 
 def test_prepare_messages_skips_source_followup_rules_without_recent_context(monkeypatch):

@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from contextlib import suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
@@ -147,6 +147,7 @@ ASSISTANT_CONTEXT_TRUNCATION_NOTICE = (
 )
 YOUTUBE_AUDIO_TRANSCRIPTION_MODEL = "mlx-community/whisper-large-v3-turbo"
 YOUTUBE_TRANSCRIPTION_CONFIRM_TTL_SECONDS = 600
+YOUTUBE_AUDIO_WORKER_STREAM_LIMIT = 8 * 1024 * 1024
 YOUTUBE_TRANSCRIPTION_ACCEPT_RESPONSES = {"1", "예", "yes", "y"}
 YOUTUBE_TRANSCRIPTION_DECLINE_RESPONSES = {"2", "아니요", "no", "n"}
 YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES = {
@@ -321,6 +322,10 @@ YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS = parse_nonnegative_float_env(
     "YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS",
     0,
 )
+YOUTUBE_AUDIO_TRANSCRIPTION_IDLE_TIMEOUT_SECONDS = parse_nonnegative_float_env(
+    "YOUTUBE_AUDIO_TRANSCRIPTION_IDLE_TIMEOUT_SECONDS",
+    900,
+)
 YOUTUBE_AUDIO_TRANSCRIPTION_MAX_CONCURRENT = parse_positive_int_env(
     "YOUTUBE_AUDIO_TRANSCRIPTION_MAX_CONCURRENT",
     1,
@@ -459,14 +464,6 @@ SOURCE_QUERY_STOPWORDS = {
 SOURCE_FOLLOWUP_SKIP_RE = re.compile(
     r"(다른\s*얘기|다른\s*주제|방금\s*(거|것)\s*무시|컨텍스트\s*무시|원문\s*무시|"
     r"ignore\s+(the\s+)?(previous|context|source)|new\s+topic)",
-    re.IGNORECASE,
-)
-SOURCE_FOLLOWUP_REFERENCE_RE = re.compile(
-    r"(이\s*(글|기사|자료|문서|pdf|피디에프|링크|영상|유튜브|트윗|포스트|원문|컨텍스트)|"
-    r"위\s*(글|기사|자료|문서|내용|링크|영상|원문|컨텍스트)|"
-    r"방금\s*(보낸|올린|읽은|첨부한)\s*(글|기사|자료|문서|pdf|피디에프|링크|영상|원문)?|"
-    r"(원문|자료|문서|링크|소스|컨텍스트)(에서|에선|기준|기반|내용|관련)|"
-    r"(this|that|the|above|previous)\s+(article|source|context|document|link|pdf|video|transcript|post))",
     re.IGNORECASE,
 )
 EXPLICIT_RECENCY_SIGNAL_RE = re.compile(
@@ -691,7 +688,7 @@ def resolve_auto_search_decision(
         return AutoSearchDecision(False, reason="auto search disabled", source="disabled")
     if tavily is None:
         return AutoSearchDecision(False, reason="missing TAVILY_API_KEY", source="missing_tavily")
-    if session_key is not None and should_apply_source_followup_rules(session_key, user_message):
+    if session_key is not None and should_apply_active_source_context(session_key, user_message):
         return AutoSearchDecision(False, reason="active source context", source="source_context")
     if should_force_auto_search(user_message):
         return AutoSearchDecision(True, query=user_message.strip(), reason="explicit recency signal", source="guardrail")
@@ -970,14 +967,20 @@ def resolve_source_context_for_request(
     search_context: str,
     source_kind: str | None = None,
     source_url: str | None = None,
+    *,
+    use_source_memory_for_context: bool = False,
 ) -> tuple[str, str | None, str | None, bool]:
     if search_context:
+        if not use_source_memory_for_context:
+            active_source_sessions.discard(session_key)
+            return search_context, source_kind, source_url, True
+
         memory = register_source_memory(session_key, search_context, source_kind, source_url)
-        if memory and memory.total_chars > SOURCE_DIRECT_CONTEXT_CHARS:
-            return build_retrieved_source_context(memory, user_message), memory.source_kind, memory.source_url, True
+        if memory:
+            active_source_sessions.add(session_key)
         return search_context, source_kind, source_url, True
 
-    if not should_apply_source_followup_rules(session_key, user_message):
+    if not should_apply_active_source_context(session_key, user_message):
         return "", source_kind, source_url, False
 
     memory = latest_source_memory(session_key)
@@ -1142,6 +1145,26 @@ def build_inbox_context_applied_reply(
         lines.extend(["", "요약", summary.strip()])
     else:
         lines.extend(["", "미리보기", build_inbox_context_preview(source)])
+
+    reply = "\n".join(lines).strip()
+    if len(reply) <= TELEGRAM_TEXT_LIMIT:
+        return reply
+    return f"{reply[: TELEGRAM_TEXT_LIMIT - 3].rstrip()}..."
+
+
+def build_inbox_context_status_reply(
+    source: InboxContextSource,
+    *,
+    enhanced: bool = False,
+) -> str:
+    title = source.title or SOURCE_KIND_LABELS.get(source.source_kind, "컨텍스트 소스")
+    lines = [f"컨텍스트 적용됨: #{source.source_id} {title}"]
+    if source.source_url:
+        lines.append(f"출처: {source.source_url}")
+    lines.append(f"본문: {len(source.text):,}자")
+    if enhanced:
+        lines.append("LLM bot 직접 URL 경로로 본문을 갱신했습니다.")
+    lines.append(f"남은 준비된 컨텍스트 큐: {source.remaining_ready_count}개")
 
     reply = "\n".join(lines).strip()
     if len(reply) <= TELEGRAM_TEXT_LIMIT:
@@ -1327,6 +1350,13 @@ def build_youtube_transcription_prompt(pending: PendingYouTubeTranscription) -> 
         ]
     )
     return "\n".join(detail_lines)
+
+
+def youtube_transcript_method_label(result: YouTubeTranscriptExtractionResult) -> str:
+    parts = [part for part in (result.selection, result.language_code) if part]
+    if result.is_generated is not None:
+        parts.append("generated" if result.is_generated else "manual")
+    return "/".join(parts) or result.status
 
 
 def build_pending_youtube_transcription(
@@ -2026,6 +2056,7 @@ async def extract_context_from_user_text(
             int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
             ok=bool(yt_context),
             source="youtube",
+            method=youtube_transcript_method_label(yt_result),
             detail=f"{video_id}:{yt_result.status}",
             chars=len(yt_context) if yt_context else 0,
         )
@@ -2042,6 +2073,13 @@ async def extract_context_from_user_text(
                     yt_result,
                 )
                 if pending is not None:
+                    logger.info(
+                        "YouTube audio fallback prompted user=%s video_id=%s status=%s reason=%s",
+                        user_id,
+                        video_id,
+                        yt_result.status,
+                        failure_message,
+                    )
                     pending_youtube_transcriptions[session_key] = pending
                     await update.message.reply_text(build_youtube_transcription_prompt(pending))
                     return ContextExtractionResult(matched=True)
@@ -2130,7 +2168,6 @@ async def extract_context_from_user_text(
 
 
 async def send_extract_only_reply(update: Update, session_key: SessionKey, extracted: ExtractedContext) -> None:
-    register_source_memory(session_key, extracted.content, extracted.source_kind, extracted.source_url)
     output_text = format_extract_only_text(extracted.content, extracted.source_kind)
     for chunk in chunk_text(output_text):
         await update.message.reply_text(chunk)
@@ -2147,6 +2184,48 @@ async def send_extract_only_reply(update: Update, session_key: SessionKey, extra
     touch_session_activity(session_key)
 
 
+async def read_stream_tail(stream, limit_chars: int = 8_000) -> str:
+    buffer = bytearray()
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        if len(buffer) > limit_chars:
+            del buffer[: len(buffer) - limit_chars]
+    return buffer.decode("utf-8", errors="replace").strip()
+
+
+async def stop_subprocess(process, timeout_seconds: float = 5.0) -> None:
+    if getattr(process, "returncode", None) is not None:
+        return
+    with suppress(ProcessLookupError):
+        process.kill()
+    with suppress(Exception):
+        await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
+
+
+def build_youtube_audio_stall_message(
+    timeout_seconds: float,
+    last_progress: tuple[int, int] | None,
+    stderr_text: str = "",
+) -> str:
+    message = f"오디오 전사 진행이 {format_duration(int(timeout_seconds))} 동안 멈춰 worker를 종료했습니다."
+    if last_progress:
+        message += f" 마지막 진행: {last_progress[0]}/{last_progress[1]}."
+    if stderr_text:
+        message += f"\n최근 오류 로그: {stderr_text[-800:]}"
+    return message
+
+
+def build_youtube_audio_failure_reply(result: dict) -> str:
+    status = str(result.get("status") or "error")
+    reason = str(result.get("message") or "원인을 확인하지 못했습니다.").strip()
+    if len(reason) > 1200:
+        reason = f"{reason[:1200].rstrip()}..."
+    return f"⚠️ 오디오 전사를 완료하지 못했습니다.\n상태: {status}\n사유: {reason}"
+
+
 async def run_youtube_audio_transcription_worker(
     update: Update,
     pending: PendingYouTubeTranscription,
@@ -2157,14 +2236,42 @@ async def run_youtube_audio_transcription_worker(
         env=youtube_audio_worker_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        limit=YOUTUBE_AUDIO_WORKER_STREAM_LIMIT,
     )
     result_payload: dict | None = None
     last_progress: tuple[int, int] | None = None
+    stderr_task = (
+        asyncio.create_task(read_stream_tail(process.stderr))
+        if process.stderr is not None
+        else None
+    )
 
     try:
         assert process.stdout is not None
         while True:
-            line = await process.stdout.readline()
+            try:
+                if YOUTUBE_AUDIO_TRANSCRIPTION_IDLE_TIMEOUT_SECONDS > 0:
+                    line = await asyncio.wait_for(
+                        process.stdout.readline(),
+                        timeout=YOUTUBE_AUDIO_TRANSCRIPTION_IDLE_TIMEOUT_SECONDS,
+                    )
+                else:
+                    line = await process.stdout.readline()
+            except asyncio.TimeoutError:
+                await stop_subprocess(process)
+                stderr_text = ""
+                if stderr_task is not None:
+                    with suppress(Exception):
+                        stderr_text = await stderr_task
+                return {
+                    "ok": False,
+                    "status": "stalled",
+                    "message": build_youtube_audio_stall_message(
+                        YOUTUBE_AUDIO_TRANSCRIPTION_IDLE_TIMEOUT_SECONDS,
+                        last_progress,
+                        stderr_text,
+                    ),
+                }
             if not line:
                 break
             try:
@@ -2183,10 +2290,11 @@ async def run_youtube_audio_transcription_worker(
             if "ok" in payload:
                 result_payload = payload
 
-        stderr_text = ""
-        if process.stderr is not None:
-            stderr_text = (await process.stderr.read()).decode("utf-8", errors="replace").strip()
         return_code = await process.wait()
+        stderr_text = ""
+        if stderr_task is not None:
+            with suppress(Exception):
+                stderr_text = await stderr_task
         if result_payload is None:
             detail = stderr_text[-800:] if stderr_text else f"worker exited with code {return_code}"
             return {"ok": False, "status": "worker_error", "message": detail}
@@ -2195,11 +2303,43 @@ async def run_youtube_audio_transcription_worker(
                 result_payload["message"] = f"{result_payload.get('message') or ''}\n{stderr_text[-800:]}".strip()
         return result_payload
     except asyncio.CancelledError:
-        with suppress(ProcessLookupError):
-            process.kill()
-        with suppress(Exception):
-            await process.wait()
+        await stop_subprocess(process)
+        if stderr_task is not None:
+            stderr_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await stderr_task
         raise
+
+
+async def execute_youtube_audio_transcription(
+    update: Update,
+    pending: PendingYouTubeTranscription,
+) -> tuple[dict, int]:
+    started_at = asyncio.get_running_loop().time()
+    try:
+        async with get_youtube_audio_transcription_semaphore():
+            if YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS > 0:
+                result = await asyncio.wait_for(
+                    run_youtube_audio_transcription_worker(update, pending),
+                    timeout=YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS,
+                )
+            else:
+                result = await run_youtube_audio_transcription_worker(update, pending)
+    except asyncio.TimeoutError:
+        result = {
+            "ok": False,
+            "status": "timeout",
+            "message": "오디오 전사 작업이 제한 시간 안에 끝나지 않았습니다.",
+        }
+    except Exception as exc:
+        logger.exception("YouTube audio transcription worker failed: %s", exc)
+        result = {
+            "ok": False,
+            "status": "worker_exception",
+            "message": str(exc) or exc.__class__.__name__,
+        }
+    elapsed_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
+    return result, elapsed_ms
 
 
 async def handle_pending_youtube_transcription_response(
@@ -2224,23 +2364,7 @@ async def handle_pending_youtube_transcription_response(
         return True
 
     await update.message.reply_text("🎙️ 오디오 전사를 시작할게요.")
-    started_at = asyncio.get_running_loop().time()
-    try:
-        async with get_youtube_audio_transcription_semaphore():
-            if YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS > 0:
-                result = await asyncio.wait_for(
-                    run_youtube_audio_transcription_worker(update, pending),
-                    timeout=YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS,
-                )
-            else:
-                result = await run_youtube_audio_transcription_worker(update, pending)
-    except asyncio.TimeoutError:
-        result = {
-            "ok": False,
-            "status": "timeout",
-            "message": "오디오 전사 작업이 제한 시간 안에 끝나지 않았습니다.",
-        }
-    elapsed_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
+    result, elapsed_ms = await execute_youtube_audio_transcription(update, pending)
     content = result.get("content") if isinstance(result.get("content"), str) else ""
     log_stage_metrics(
         "youtube_audio_transcription",
@@ -2252,8 +2376,7 @@ async def handle_pending_youtube_transcription_response(
         chars=len(content),
     )
     if not result.get("ok") or not content:
-        message = str(result.get("message") or "오디오 전사에 실패했습니다.")
-        await update.message.reply_text(f"⚠️ {message}")
+        await update.message.reply_text(build_youtube_audio_failure_reply(result))
         return True
 
     extracted = ExtractedContext(
@@ -2277,6 +2400,117 @@ async def handle_pending_youtube_transcription_response(
         source_url=pending.canonical_youtube_url,
     )
     return True
+
+
+async def enhance_inbox_youtube_context_source(
+    update: Update,
+    user_id: int,
+    source: InboxContextSource,
+) -> tuple[InboxContextSource, bool]:
+    if source.source_kind != "youtube" or not source.source_url:
+        return source, False
+
+    match = YOUTUBE_URL_PATTERN.search(source.source_url)
+    if not match:
+        logger.info(
+            "Inbox YouTube context skipped enhancement source_id=%s reason=missing_video_id url=%s",
+            source.source_id,
+            source.source_url,
+        )
+        return source, False
+
+    video_id = match.group(1)
+    canonical_url = normalize_source_url(source.source_url, "youtube") or source.source_url
+    await update.message.reply_text("🎬 Inbox YouTube 컨텍스트를 직접 URL 경로로 다시 추출 중...")
+
+    stage_started_at = asyncio.get_running_loop().time()
+    yt_result = await asyncio.to_thread(extract_youtube_transcript_result, video_id)
+    yt_context = yt_result.content
+    log_stage_metrics(
+        "inbox_context_hydration",
+        user_id,
+        int((asyncio.get_running_loop().time() - stage_started_at) * 1000),
+        ok=bool(yt_context),
+        source="youtube",
+        method=youtube_transcript_method_label(yt_result),
+        detail=f"source_id={source.source_id} video_id={video_id}:{yt_result.status}",
+        chars=len(yt_context) if yt_context else 0,
+    )
+    if yt_context:
+        if yt_result.message:
+            await update.message.reply_text(f"ℹ️ {yt_result.message}")
+        logger.info(
+            "Inbox YouTube context enhanced from transcript source_id=%s video_id=%s original_chars=%s enhanced_chars=%s status=%s method=%s",
+            source.source_id,
+            video_id,
+            len(source.text),
+            len(yt_context),
+            yt_result.status,
+            youtube_transcript_method_label(yt_result),
+        )
+        return replace(source, text=yt_context, source_url=canonical_url), True
+
+    pending, fallback_issue = await asyncio.to_thread(
+        build_pending_youtube_transcription,
+        video_id,
+        source.source_url,
+        canonical_url,
+        DEFAULT_CONTEXT_PROMPT,
+        False,
+        yt_result,
+    )
+    if pending is None:
+        if fallback_issue:
+            await update.message.reply_text(
+                f"ℹ️ 직접 URL 경로 보강은 건너뜁니다: {fallback_issue}\n"
+                "Inbox에 저장된 기존 컨텍스트를 사용합니다."
+            )
+        logger.info(
+            "Inbox YouTube context using stored text source_id=%s video_id=%s original_chars=%s transcript_status=%s fallback_issue=%s",
+            source.source_id,
+            video_id,
+            len(source.text),
+            yt_result.status,
+            fallback_issue or "",
+        )
+        return replace(source, source_url=canonical_url), False
+
+    await update.message.reply_text("🎙️ 공개 자막이 막혀 Inbox YouTube 컨텍스트를 오디오 전사로 보강합니다.")
+    result, elapsed_ms = await execute_youtube_audio_transcription(update, pending)
+    content = result.get("content") if isinstance(result.get("content"), str) else ""
+    log_stage_metrics(
+        "inbox_context_youtube_audio_transcription",
+        user_id,
+        elapsed_ms,
+        ok=bool(result.get("ok")),
+        source="youtube_audio",
+        detail=f"source_id={source.source_id} video_id={video_id}:{result.get('status')}",
+        chars=len(content),
+    )
+    if not result.get("ok") or not content:
+        await update.message.reply_text(
+            f"{build_youtube_audio_failure_reply(result)}\n\n"
+            "Inbox에 저장된 기존 컨텍스트를 대신 사용합니다."
+        )
+        logger.info(
+            "Inbox YouTube context using stored text after audio failure source_id=%s video_id=%s original_chars=%s status=%s",
+            source.source_id,
+            video_id,
+            len(source.text),
+            result.get("status"),
+        )
+        return replace(source, source_url=canonical_url), False
+
+    logger.info(
+        "Inbox YouTube context enhanced from audio source_id=%s video_id=%s original_chars=%s enhanced_chars=%s status=%s cached=%s",
+        source.source_id,
+        video_id,
+        len(source.text),
+        len(content),
+        result.get("status"),
+        result.get("cached"),
+    )
+    return replace(source, text=content, source_url=canonical_url), True
 
 
 async def send_message_draft(update: Update, draft_id: int, text: str) -> bool:
@@ -2406,20 +2640,21 @@ def build_llm_context_history(history: list[ChatMessage]) -> list[ChatMessage]:
 
 
 def has_recent_source_context(session_key: SessionKey, max_messages: int = 8) -> bool:
-    memory = latest_source_memory(session_key)
-    if memory:
-        history_len = len(conversations.get(session_key, []))
-        if history_len == 0 or history_len - memory.created_turn_index <= max_messages:
-            return True
-
     for message in reversed(conversations.get(session_key, [])[-max_messages:]):
         if message.get("role") == "user" and "[User Question]" in message.get("content", ""):
             return True
     return False
 
 
-def has_explicit_source_followup_reference(user_message: str) -> bool:
-    return bool(SOURCE_FOLLOWUP_REFERENCE_RE.search(user_message.strip()))
+def should_apply_active_source_context(session_key: SessionKey, user_message: str) -> bool:
+    stripped = user_message.strip()
+    if not stripped:
+        return False
+    if SOURCE_FOLLOWUP_SKIP_RE.search(stripped):
+        return False
+    if GENERAL_URL_PATTERN.search(stripped):
+        return False
+    return session_key in active_source_sessions and latest_source_memory(session_key) is not None
 
 
 def should_apply_source_followup_rules(session_key: SessionKey, user_message: str) -> bool:
@@ -2430,10 +2665,8 @@ def should_apply_source_followup_rules(session_key: SessionKey, user_message: st
         return False
     if GENERAL_URL_PATTERN.search(stripped):
         return False
-    if session_key in active_source_sessions and latest_source_memory(session_key):
+    if should_apply_active_source_context(session_key, stripped):
         return True
-    if not has_explicit_source_followup_reference(stripped):
-        return False
     return has_recent_source_context(session_key)
 
 
@@ -2640,6 +2873,7 @@ async def stream_reply(
             search_context,
             source_kind=source_kind,
             source_url=source_url,
+            use_source_memory_for_context=source == "inbox_context",
         )
     )
     messages = prepare_messages(
@@ -3176,6 +3410,16 @@ async def handle_inbox_context(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("사용법: /ctx 또는 /ctx latest")
         return
 
+    typing_indicator = start_typing_indicator(update)
+    typing_token = _active_typing_indicator.set(typing_indicator)
+    try:
+        await handle_inbox_context_with_typing(update, user_id)
+    finally:
+        _active_typing_indicator.reset(typing_token)
+        await stop_typing_indicator(typing_indicator)
+
+
+async def handle_inbox_context_with_typing(update: Update, user_id: int):
     cleanup_inactive_sessions()
     current_session_key = build_session_key(user_id, update.message)
     if current_session_key is None:
@@ -3195,6 +3439,9 @@ async def handle_inbox_context(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("가져올 준비된 컨텍스트가 없어요. Inbox bot에 URL /ctx 로 먼저 넣어두면 됩니다.")
         return
 
+    original_chars = len(source.text)
+    source, enhanced = await enhance_inbox_youtube_context_source(update, user_id, source)
+
     try:
         apply_inbox_context_source_to_session(current_session_key, source)
     except Exception as exc:
@@ -3212,13 +3459,26 @@ async def handle_inbox_context(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    summary = None
-    try:
-        summary = await asyncio.to_thread(summarize_inbox_context_source, source)
-    except Exception as exc:
-        logger.warning("Inbox context summary failed source_id=%s: %s", source.source_id, exc)
-
-    await update.message.reply_text(build_inbox_context_applied_reply(source, summary))
+    logger.info(
+        "Inbox context applied source_id=%s kind=%s url=%s chars=%s original_chars=%s enhanced=%s remaining=%s",
+        source.source_id,
+        source.source_kind,
+        source.source_url or "",
+        len(source.text),
+        original_chars,
+        enhanced,
+        source.remaining_ready_count,
+    )
+    await update.message.reply_text(build_inbox_context_status_reply(source, enhanced=enhanced))
+    await stream_context_reply(
+        update,
+        user_id,
+        DEFAULT_CONTEXT_PROMPT,
+        source.text,
+        source="inbox_context",
+        source_kind=source.source_kind,
+        source_url=source.source_url,
+    )
 
 
 async def handle_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
