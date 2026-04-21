@@ -515,6 +515,14 @@ DYNAMIC_MARKET_SIGNAL_RE = re.compile(
     r"(\$[A-Z]{1,6}\b|\b(CPI|FOMC|GDP|PCE|EPS|SEC|FDA)\b|금리|환율|인플레이션|실업률|실적발표)",
     re.IGNORECASE,
 )
+SOURCE_LOCAL_REFERENCE_RE = re.compile(
+    r"(방금\s*(넣은|보낸|첨부|적용)|이\s*(글|영상|자료|소스|컨텍스트|내용)|원문|첨부\s*(자료|영상|글))",
+    re.IGNORECASE,
+)
+SOURCE_LOCAL_TASK_RE = re.compile(
+    r"(요약|정리|핵심|무슨\s*내용|내용인지|설명|뜻|의미|summary|summarize|overview|tl;?dr|gist)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -611,6 +619,13 @@ def should_force_auto_search(user_message: str) -> bool:
     if not stripped:
         return False
     return bool(EXPLICIT_RECENCY_SIGNAL_RE.search(stripped) or DYNAMIC_MARKET_SIGNAL_RE.search(stripped))
+
+
+def is_source_local_followup(user_message: str) -> bool:
+    stripped = user_message.strip()
+    if not stripped:
+        return False
+    return bool(SOURCE_LOCAL_REFERENCE_RE.search(stripped) and SOURCE_LOCAL_TASK_RE.search(stripped))
 
 
 def _format_classifier_history(session_key: SessionKey | None, max_messages: int = 6) -> str:
@@ -723,8 +738,9 @@ def resolve_auto_search_decision(
         return AutoSearchDecision(False, reason="auto search disabled", source="disabled")
     if tavily is None:
         return AutoSearchDecision(False, reason="missing TAVILY_API_KEY", source="missing_tavily")
-    if session_key is not None and should_apply_active_source_context(session_key, user_message):
-        return AutoSearchDecision(False, reason="active source context", source="source_context")
+    active_source_context = session_key is not None and should_apply_active_source_context(session_key, user_message)
+    if active_source_context and is_source_local_followup(user_message):
+        return AutoSearchDecision(False, reason="active source local follow-up", source="source_context")
     if should_force_auto_search(user_message):
         return AutoSearchDecision(True, query=user_message.strip(), reason="explicit recency signal", source="guardrail")
 
@@ -996,6 +1012,21 @@ def build_retrieved_source_context(memory: SourceMemory, user_message: str) -> s
     return "\n".join(header_parts + [""] + body_parts).strip()
 
 
+def build_combined_source_and_search_context(source_context: str, search_context: str) -> str:
+    return (
+        "[Combined Source And Web Search Context]\n"
+        "[Context Combination Rules]\n"
+        "- The prior source context is the user's active reference material.\n"
+        "- The web search results provide current external information.\n"
+        "- Use both when the user's question depends on the source and current facts.\n"
+        "- If they conflict, say so explicitly and prefer web search results for time-sensitive facts.\n\n"
+        "[Prior Source Context]\n"
+        f"{source_context.strip()}\n\n"
+        "[Current Web Search Context]\n"
+        f"{search_context.strip()}"
+    )
+
+
 def resolve_source_context_for_request(
     session_key: SessionKey,
     user_message: str,
@@ -1004,8 +1035,19 @@ def resolve_source_context_for_request(
     source_url: str | None = None,
     *,
     use_source_memory_for_context: bool = False,
+    preserve_active_source_context: bool = False,
 ) -> tuple[str, str | None, str | None, bool]:
     if search_context:
+        if preserve_active_source_context and should_apply_active_source_context(session_key, user_message):
+            memory = latest_source_memory(session_key)
+            if memory:
+                source_context = build_retrieved_source_context(memory, user_message)
+                return (
+                    build_combined_source_and_search_context(source_context, search_context),
+                    memory.source_kind,
+                    memory.source_url,
+                    False,
+                )
         if not use_source_memory_for_context:
             active_source_sessions.discard(session_key)
             return search_context, source_kind, source_url, True
@@ -1200,6 +1242,24 @@ def build_inbox_context_status_reply(
     if enhanced:
         lines.append("LLM bot 직접 URL 경로로 본문을 갱신했습니다.")
     lines.append(f"남은 준비된 컨텍스트 큐: {source.remaining_ready_count}개")
+
+    reply = "\n".join(lines).strip()
+    if len(reply) <= TELEGRAM_TEXT_LIMIT:
+        return reply
+    return f"{reply[: TELEGRAM_TEXT_LIMIT - 3].rstrip()}..."
+
+
+def build_inbox_context_processing_reply(source: InboxContextSource) -> str:
+    title = source.title or SOURCE_KIND_LABELS.get(source.source_kind, "컨텍스트 소스")
+    lines = [
+        f"처리할 컨텍스트: #{source.source_id} {title}",
+        f"종류: {SOURCE_KIND_LABELS.get(source.source_kind, source.source_kind)}",
+    ]
+    if source.source_url:
+        lines.append(f"출처: {source.source_url}")
+    lines.append(f"Inbox 저장 본문: {len(source.text):,}자")
+    if source.source_kind == "youtube" and source.source_url:
+        lines.append("YouTube 원문을 다시 확인한 뒤 요약/전사를 시작합니다.")
 
     reply = "\n".join(lines).strip()
     if len(reply) <= TELEGRAM_TEXT_LIMIT:
@@ -2456,7 +2516,7 @@ async def enhance_inbox_youtube_context_source(
 
     video_id = match.group(1)
     canonical_url = normalize_source_url(source.source_url, "youtube") or source.source_url
-    await update.message.reply_text("🎬 Inbox YouTube 컨텍스트를 직접 URL 경로로 다시 추출 중...")
+    await update.message.reply_text(f"🎬 YouTube 컨텍스트를 다시 추출 중...\n출처: {canonical_url}")
 
     stage_started_at = asyncio.get_running_loop().time()
     yt_result = await asyncio.to_thread(extract_youtube_transcript_result, video_id)
@@ -2909,6 +2969,7 @@ async def stream_reply(
             source_kind=source_kind,
             source_url=source_url,
             use_source_memory_for_context=source == "inbox_context",
+            preserve_active_source_context=source in {"auto_search", "search_suffix", "search_command"},
         )
     )
     messages = prepare_messages(
@@ -3474,6 +3535,7 @@ async def handle_inbox_context_with_typing(update: Update, user_id: int):
         await update.message.reply_text("가져올 준비된 컨텍스트가 없어요. Inbox bot에 URL /ctx 로 먼저 넣어두면 됩니다.")
         return
 
+    await update.message.reply_text(build_inbox_context_processing_reply(source))
     original_chars = len(source.text)
     source, enhanced = await enhance_inbox_youtube_context_source(update, user_id, source)
 

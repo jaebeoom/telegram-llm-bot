@@ -180,6 +180,36 @@ def test_direct_context_replaces_active_inbox_context_mode():
     assert key not in bot.active_source_sessions
 
 
+def test_search_context_can_preserve_active_inbox_context():
+    key = session_key(301)
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="web",
+        source_url="https://example.com/inbox",
+        title="Inbox Article",
+        text="[Web Article]\nInbox 본문",
+        remaining_ready_count=0,
+    )
+    bot.apply_inbox_context_source_to_session(key, source)
+
+    effective_context, source_kind, source_url, store_context = bot.resolve_source_context_for_request(
+        key,
+        "이 글의 현재 소비자 반응은?",
+        "[Web Search Results]\n검색 결과",
+        preserve_active_source_context=True,
+    )
+
+    assert effective_context.startswith("[Combined Source And Web Search Context]")
+    assert "[Prior Source Context]" in effective_context
+    assert "[Current Web Search Context]" in effective_context
+    assert "Inbox 본문" in effective_context
+    assert "검색 결과" in effective_context
+    assert source_kind == "web"
+    assert source_url == "https://example.com/inbox"
+    assert store_context is False
+    assert key in bot.active_source_sessions
+
+
 def test_inbox_initial_source_context_uses_full_context_while_registering_memory():
     key = session_key(301)
     long_context = "[Web Article]\n" + "첫 구간 성장 서술. " * 900 + "중간 구간 비용 압박. " * 900
@@ -345,7 +375,26 @@ def test_build_inbox_context_applied_reply_includes_summary_and_url():
     assert "요약\n핵심 요약입니다." in reply
 
 
-def test_resolve_auto_search_decision_skips_classifier_for_active_source_context(monkeypatch):
+def test_build_inbox_context_processing_reply_includes_title_and_url():
+    source = bot.InboxContextSource(
+        source_id=8,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video Title",
+        text="[YouTube Transcript]\n본문",
+        remaining_ready_count=0,
+    )
+
+    reply = bot.build_inbox_context_processing_reply(source)
+
+    assert "처리할 컨텍스트: #8 Video Title" in reply
+    assert "종류: YouTube" in reply
+    assert "출처: https://www.youtube.com/watch?v=abcdefghijk" in reply
+    assert "Inbox 저장 본문:" in reply
+    assert "YouTube 원문을 다시 확인한 뒤 요약/전사를 시작합니다." in reply
+
+
+def test_resolve_auto_search_decision_skips_source_local_active_context(monkeypatch):
     key = session_key(305)
     source = bot.InboxContextSource(
         source_id=12,
@@ -358,11 +407,76 @@ def test_resolve_auto_search_decision_skips_classifier_for_active_source_context
     bot.apply_inbox_context_source_to_session(key, source)
 
     monkeypatch.setattr(bot, "tavily", object())
-    monkeypatch.setattr(bot, "classify_recency_need", lambda *_args, **_kwargs: pytest.fail("should not classify"))
+    monkeypatch.setattr(
+        bot,
+        "classify_recency_need",
+        lambda *_args, **_kwargs: pytest.fail("source-local summary should not classify"),
+    )
 
     decision = bot.resolve_auto_search_decision("방금 넣은 것 무슨 내용인지 요약해줘", key)
 
-    assert decision == bot.AutoSearchDecision(False, reason="active source context", source="source_context")
+    assert decision == bot.AutoSearchDecision(
+        False,
+        reason="active source local follow-up",
+        source="source_context",
+    )
+
+
+def test_resolve_auto_search_decision_uses_classifier_for_active_source_context(monkeypatch):
+    key = session_key(305)
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="영상 제목",
+        text="[YouTube Transcript]\n본문",
+        remaining_ready_count=0,
+    )
+    bot.apply_inbox_context_source_to_session(key, source)
+
+    monkeypatch.setattr(bot, "tavily", object())
+    monkeypatch.setattr(
+        bot,
+        "classify_recency_need",
+        lambda user_message, session_key=None: bot.AutoSearchDecision(
+            False,
+            reason="classifier checked active source",
+            source="classifier",
+        ),
+    )
+
+    decision = bot.resolve_auto_search_decision("이 주장과 내 논리가 충돌하는지 봐줘", key)
+
+    assert decision == bot.AutoSearchDecision(
+        False,
+        reason="classifier checked active source",
+        source="classifier",
+    )
+
+
+def test_resolve_auto_search_decision_uses_guardrail_inside_active_source_context(monkeypatch):
+    key = session_key(305)
+    source = bot.InboxContextSource(
+        source_id=12,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="영상 제목",
+        text="[YouTube Transcript]\n본문",
+        remaining_ready_count=0,
+    )
+    bot.apply_inbox_context_source_to_session(key, source)
+
+    monkeypatch.setattr(bot, "tavily", object())
+    monkeypatch.setattr(
+        bot,
+        "classify_recency_need",
+        lambda *_args, **_kwargs: pytest.fail("guardrail should run before classifier"),
+    )
+
+    decision = bot.resolve_auto_search_decision("이 주제의 현재 시장 반응은?", key)
+
+    assert decision.needs_search is True
+    assert decision.source == "guardrail"
 
 
 def test_resolve_auto_search_decision_uses_classifier_for_regular_context_followup(monkeypatch):
@@ -1016,7 +1130,10 @@ def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
     assert consumed == [12]
     assert bot.source_memories[key][-1].source_url == "https://example.com/article"
     assert key in bot.active_source_sessions
-    assert update.message.replies == [bot.build_inbox_context_status_reply(source)]
+    assert update.message.replies == [
+        bot.build_inbox_context_processing_reply(source),
+        bot.build_inbox_context_status_reply(source),
+    ]
     assert stream_calls == [
         (
             31,
@@ -1089,7 +1206,10 @@ def test_handle_inbox_context_keeps_typing_visible_while_waiting(monkeypatch):
 
     assert events == ["started", "stopped"]
     assert consumed == [13]
-    assert update.message.replies == [bot.build_inbox_context_status_reply(source)]
+    assert update.message.replies == [
+        bot.build_inbox_context_processing_reply(source),
+        bot.build_inbox_context_status_reply(source),
+    ]
     assert stream_calls
 
 
@@ -1173,7 +1293,8 @@ def test_handle_inbox_context_enhances_youtube_with_audio_fallback(monkeypatch):
     )
     assert consumed == [14]
     assert update.message.replies == [
-        "🎬 Inbox YouTube 컨텍스트를 직접 URL 경로로 다시 추출 중...",
+        bot.build_inbox_context_processing_reply(source),
+        "🎬 YouTube 컨텍스트를 다시 추출 중...\n출처: https://www.youtube.com/watch?v=abcdefghijk",
         "🎙️ 공개 자막이 막혀 Inbox YouTube 컨텍스트를 오디오 전사로 보강합니다.",
         bot.build_inbox_context_status_reply(enhanced_source, enhanced=True),
     ]
