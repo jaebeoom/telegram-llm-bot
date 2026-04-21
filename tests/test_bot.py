@@ -1841,6 +1841,38 @@ def test_build_chat_completion_payload_keeps_server_default_for_plain_chat(monke
     assert "chat_template_kwargs" not in payload
 
 
+def test_redact_log_secrets_removes_telegram_bot_token():
+    token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi"
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+
+    redacted = bot.redact_log_secrets(f"HTTP Request: POST {url}")
+
+    assert token not in redacted
+    assert "api.telegram.org/" in redacted
+    assert bot.REDACTED_TELEGRAM_BOT_TOKEN in redacted
+    assert "/getUpdates" in redacted
+
+
+def test_secret_redaction_filter_redacts_log_record_args():
+    token = "987654321:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    record = bot.logging.LogRecord(
+        "httpx",
+        bot.logging.INFO,
+        __file__,
+        1,
+        "HTTP Request: POST %s %s",
+        (url, {"token": token}),
+        None,
+    )
+
+    assert bot.SecretRedactionFilter().filter(record) is True
+    rendered = record.getMessage()
+
+    assert token not in rendered
+    assert bot.REDACTED_TELEGRAM_BOT_TOKEN in rendered
+
+
 def test_save_session_to_vault_uses_full_session_history(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "VAULT_CAPTURE_PATH", str(tmp_path))
     monkeypatch.setattr(bot, "generate_tags", lambda history: "#test-tag")

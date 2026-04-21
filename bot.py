@@ -52,6 +52,40 @@ SOURCE_KIND_LABELS = {
     "pdf": "PDF",
     "web": "웹 아티클",
 }
+TELEGRAM_BOT_TOKEN_RE = re.compile(
+    r"bot\d{6,}:[A-Za-z0-9_-]{20,}|(?<![A-Za-z0-9_-])\d{6,}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
+)
+REDACTED_TELEGRAM_BOT_TOKEN = "[REDACTED_TELEGRAM_BOT_TOKEN]"
+
+
+def redact_log_secrets(text: str) -> str:
+    return TELEGRAM_BOT_TOKEN_RE.sub(REDACTED_TELEGRAM_BOT_TOKEN, text)
+
+
+def _redact_log_value(value):
+    if isinstance(value, str):
+        return redact_log_secrets(value)
+    if isinstance(value, tuple):
+        return tuple(_redact_log_value(item) for item in value)
+    if isinstance(value, list):
+        return [_redact_log_value(item) for item in value]
+    if isinstance(value, dict):
+        return {_redact_log_value(key): _redact_log_value(item) for key, item in value.items()}
+    return value
+
+
+class SecretRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_log_value(record.msg)
+        record.args = _redact_log_value(record.args)
+        return True
+
+
+def install_log_redaction_filter() -> None:
+    root_logger = logging.getLogger()
+    secret_filter = SecretRedactionFilter()
+    for handler in root_logger.handlers:
+        handler.addFilter(secret_filter)
 
 
 def load_environment() -> list[str]:
@@ -352,6 +386,7 @@ logger = logging.getLogger(__name__)
 file_handler = logging.FileHandler(Path(__file__).resolve().parent / "bot.log", encoding="utf-8")
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
 logging.getLogger().addHandler(file_handler)
+install_log_redaction_filter()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 if ENV_FILES_LOADED:
