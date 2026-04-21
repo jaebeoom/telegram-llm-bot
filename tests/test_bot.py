@@ -767,9 +767,33 @@ def test_handle_message_reports_specific_youtube_transcript_failure(monkeypatch)
     ]
 
 
-def test_handle_message_prompts_for_youtube_audio_transcription_when_enabled(monkeypatch):
-    async def fail_stream_reply(*_args, **_kwargs):
-        pytest.fail("pending YouTube audio transcription should wait for confirmation")
+def test_handle_message_auto_starts_youtube_audio_transcription_when_enabled(monkeypatch):
+    calls = []
+
+    async def fake_execute_youtube_audio_transcription(update, pending):
+        assert pending.video_id == "abcdefghijk"
+        assert pending.user_message == "요약"
+        assert pending.duration == 5400
+        return (
+            {
+                "ok": True,
+                "status": "ok",
+                "message": "transcribed",
+                "content": "[YouTube Transcript]\n전사 본문",
+            },
+            1234,
+        )
+
+    async def fake_stream_context_reply(
+        update,
+        user_id,
+        user_message,
+        search_context,
+        source="context",
+        source_kind=None,
+        source_url=None,
+    ):
+        calls.append((user_id, user_message, search_context, source, source_kind, source_url))
 
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
     monkeypatch.setattr(bot, "ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION", True)
@@ -796,7 +820,8 @@ def test_handle_message_prompts_for_youtube_audio_transcription_when_enabled(mon
             message="이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다.",
         ),
     )
-    monkeypatch.setattr(bot, "stream_reply", fail_stream_reply)
+    monkeypatch.setattr(bot, "execute_youtube_audio_transcription", fake_execute_youtube_audio_transcription)
+    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
 
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=22),
@@ -804,20 +829,23 @@ def test_handle_message_prompts_for_youtube_audio_transcription_when_enabled(mon
     )
 
     asyncio.run(bot.handle_message(update, None))
-    pending = bot.pending_youtube_transcriptions[session_key(22)]
 
-    assert pending.video_id == "abcdefghijk"
-    assert pending.user_message == "요약"
-    assert pending.duration == 5400
-    assert "오디오를 받아서 로컬 전사를 시도할까요?" in update.message.replies[-1]
-    assert "1. 예" in update.message.replies[-1]
-    assert "2. 아니요" in update.message.replies[-1]
-    assert "전사하기" not in update.message.replies[-1]
-    assert "취소" not in update.message.replies[-1]
-    assert "Long interview" not in update.message.replies[-1]
-    assert "Test Channel" not in update.message.replies[-1]
-    assert "길이:" not in update.message.replies[-1]
-    assert "전사 모델:" not in update.message.replies[-1]
+    assert session_key(22) not in bot.pending_youtube_transcriptions
+    assert update.message.replies == [
+        "🎬 스크립트 추출 중...",
+        "🎙️ 공개 자막을 가져오지 못해 오디오 전사를 바로 시작합니다.\n"
+        "사유: 이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다.",
+    ]
+    assert calls == [
+        (
+            22,
+            "요약",
+            "[YouTube Transcript]\n전사 본문",
+            "youtube_audio",
+            "youtube",
+            "https://www.youtube.com/watch?v=abcdefghijk",
+        )
+    ]
 
 
 def test_youtube_transcript_parse_error_is_audio_fallback_eligible():

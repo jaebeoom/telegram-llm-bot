@@ -1447,6 +1447,15 @@ def build_youtube_transcription_prompt(pending: PendingYouTubeTranscription) -> 
     return "\n".join(detail_lines)
 
 
+def build_youtube_auto_transcription_start_reply(pending: PendingYouTubeTranscription) -> str:
+    return "\n".join(
+        [
+            "🎙️ 공개 자막을 가져오지 못해 오디오 전사를 바로 시작합니다.",
+            f"사유: {pending.failure_message}",
+        ]
+    )
+
+
 def youtube_transcript_method_label(result: YouTubeTranscriptExtractionResult) -> str:
     parts = [part for part in (result.selection, result.language_code) if part]
     if result.is_generated is not None:
@@ -2157,30 +2166,51 @@ async def extract_context_from_user_text(
         )
         if not yt_context:
             failure_message = yt_result.message or "스크립트를 가져올 수 없습니다."
-            if session_key is not None:
-                pending, fallback_issue = await asyncio.to_thread(
-                    build_pending_youtube_transcription,
+            pending, fallback_issue = await asyncio.to_thread(
+                build_pending_youtube_transcription,
+                video_id,
+                youtube_url,
+                canonical_youtube_url,
+                remove_url_once(user_text, youtube_url),
+                extract_only_requested,
+                yt_result,
+            )
+            if pending is not None:
+                logger.info(
+                    "YouTube audio fallback started automatically user=%s video_id=%s status=%s reason=%s",
+                    user_id,
                     video_id,
-                    youtube_url,
-                    canonical_youtube_url,
-                    remove_url_once(user_text, youtube_url),
-                    extract_only_requested,
-                    yt_result,
+                    yt_result.status,
+                    failure_message,
                 )
-                if pending is not None:
-                    logger.info(
-                        "YouTube audio fallback prompted user=%s video_id=%s status=%s reason=%s",
-                        user_id,
-                        video_id,
-                        yt_result.status,
-                        failure_message,
-                    )
-                    pending_youtube_transcriptions[session_key] = pending
-                    await update.message.reply_text(build_youtube_transcription_prompt(pending))
+                await update.message.reply_text(build_youtube_auto_transcription_start_reply(pending))
+                result, elapsed_ms = await execute_youtube_audio_transcription(update, pending)
+                content = result.get("content") if isinstance(result.get("content"), str) else ""
+                log_stage_metrics(
+                    "youtube_audio_transcription",
+                    user_id,
+                    elapsed_ms,
+                    ok=bool(result.get("ok")),
+                    source="youtube_audio",
+                    detail=f"{video_id}:{result.get('status')}",
+                    chars=len(content),
+                )
+                if not result.get("ok") or not content:
+                    await update.message.reply_text(build_youtube_audio_failure_reply(result))
                     return ContextExtractionResult(matched=True)
-                if fallback_issue and ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION:
-                    await update.message.reply_text(f"⚠️ {failure_message}\n\n{fallback_issue}")
-                    return ContextExtractionResult(matched=True)
+                return ContextExtractionResult(
+                    matched=True,
+                    extracted=ExtractedContext(
+                        user_message=pending.user_message,
+                        content=content,
+                        source="youtube_audio",
+                        source_kind="youtube",
+                        source_url=pending.canonical_youtube_url,
+                    ),
+                )
+            if fallback_issue and ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION:
+                await update.message.reply_text(f"⚠️ {failure_message}\n\n{fallback_issue}")
+                return ContextExtractionResult(matched=True)
             await update.message.reply_text(f"⚠️ {failure_message}")
             return ContextExtractionResult(matched=True)
 
