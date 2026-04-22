@@ -388,7 +388,7 @@ def test_build_inbox_context_processing_reply_includes_title_and_url():
     assert "컨텍스트 준비 중: #8 Video Title" in reply
     assert "종류: YouTube" in reply
     assert "출처: https://www.youtube.com/watch?v=abcdefghijk" in reply
-    assert "Inbox 저장 본문:" in reply
+    assert "먼저 읽은 본문:" in reply
     assert "YouTube 자막을 확인해 필요하면 오디오 전사로 보강합니다." in reply
 
 

@@ -229,7 +229,7 @@ YouTube 오디오 전사는 `mlx-community/whisper-large-v3-turbo` 모델을 별
 
 `telegram-inbox-bot`에 `/ctx URL` 또는 `URL /ctx`로 넣은 소스는 일반 노트가 아니라 FIFO 컨텍스트 큐에 적재됩니다. 이 봇에서 `/ctx`를 입력하면 Inbox API의 오래된 ready 소스 1개를 가져와 현재 Telegram 세션 source memory에 붙이고, 세션 적용이 성공한 뒤 Inbox 쪽 source를 consumed 처리합니다. 적용 상태에는 title, URL, 본문 길이, 남은 큐 수가 표시되고, 실제 요약 답변은 직접 URL을 보냈을 때와 같은 streaming context 경로로 생성됩니다.
 
-Inbox YouTube source는 LLM bot에서 같은 URL을 다시 추출해 공개 자막 결과로 갱신합니다. 공개 자막 요청이 YouTube의 `request_blocked` 등으로 실패하고 오디오 전사 fallback이 켜져 있으면, 직접 URL 주입과 같은 자동 전사 경로로 inbox의 짧은 추출본 대신 전사 전문을 적용합니다. 전사도 실패하면 실패 사유를 보낸 뒤 Inbox에 저장된 기존 컨텍스트를 사용합니다.
+Inbox YouTube source는 LLM bot에서 같은 URL을 다시 추출해 공개 자막 결과로 갱신합니다. 공개 자막 요청이 YouTube의 `request_blocked` 등으로 실패하고 오디오 전사 fallback이 켜져 있으면, 직접 URL 주입과 같은 자동 전사 경로로 먼저 읽어둔 본문 대신 전사 전문을 적용합니다. 전사도 실패하면 실패 사유를 보낸 뒤 먼저 읽어둔 본문을 사용합니다.
 
 첫 구현은 임베딩 없이 큐 방식으로 동작합니다. 가져온 소스는 `/c`로 세션을 종료하기 전까지 현재 LLM 세션의 활성 컨텍스트로 남습니다. 활성 컨텍스트가 있을 때도 일반 후속 질문은 자동 검색 분류를 거치며, 검색이 필요한 경우 검색 결과와 source memory에서 고른 관련 chunk를 함께 사용합니다. 명시적으로 검색하려면 `/s`를 사용할 수 있습니다.
 

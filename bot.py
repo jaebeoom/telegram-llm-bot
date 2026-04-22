@@ -1251,7 +1251,7 @@ def build_inbox_context_processing_reply(source: InboxContextSource) -> str:
     ]
     if source.source_url:
         lines.append(f"출처: {source.source_url}")
-    lines.append(f"Inbox 저장 본문: {len(source.text):,}자")
+    lines.append(f"먼저 읽은 본문: {len(source.text):,}자")
     if source.source_kind == "youtube" and source.source_url:
         lines.append("YouTube 자막을 확인해 필요하면 오디오 전사로 보강합니다.")
 
@@ -2480,7 +2480,7 @@ async def enhance_inbox_youtube_context_source(
         if fallback_issue:
             await update.message.reply_text(
                 f"ℹ️ YouTube 원문 보강은 건너뜁니다: {fallback_issue}\n"
-                "Inbox에 저장된 기존 컨텍스트를 사용합니다."
+                "먼저 읽어둔 본문을 사용합니다."
             )
         logger.info(
             "Inbox YouTube context using stored text source_id=%s video_id=%s original_chars=%s transcript_status=%s fallback_issue=%s",
@@ -2507,7 +2507,7 @@ async def enhance_inbox_youtube_context_source(
     if not result.get("ok") or not content:
         await update.message.reply_text(
             f"{build_youtube_audio_failure_reply(result)}\n\n"
-            "Inbox에 저장된 기존 컨텍스트를 대신 사용합니다."
+            "먼저 읽어둔 본문을 대신 사용합니다."
         )
         logger.info(
             "Inbox YouTube context using stored text after audio failure source_id=%s video_id=%s original_chars=%s status=%s",
