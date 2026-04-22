@@ -22,7 +22,6 @@ def clear_histories():
     bot.active_source_sessions.clear()
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
-    bot.pending_youtube_transcriptions.clear()
     bot.youtube_audio_transcription_semaphore = None
     yield
     bot.conversations.clear()
@@ -31,7 +30,6 @@ def clear_histories():
     bot.active_source_sessions.clear()
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
-    bot.pending_youtube_transcriptions.clear()
     bot.youtube_audio_transcription_semaphore = None
 
 
@@ -387,11 +385,30 @@ def test_build_inbox_context_processing_reply_includes_title_and_url():
 
     reply = bot.build_inbox_context_processing_reply(source)
 
-    assert "처리할 컨텍스트: #8 Video Title" in reply
+    assert "컨텍스트 준비 중: #8 Video Title" in reply
     assert "종류: YouTube" in reply
     assert "출처: https://www.youtube.com/watch?v=abcdefghijk" in reply
     assert "Inbox 저장 본문:" in reply
-    assert "YouTube 원문을 다시 확인한 뒤 요약/전사를 시작합니다." in reply
+    assert "YouTube 자막을 확인해 필요하면 오디오 전사로 보강합니다." in reply
+
+
+def test_build_inbox_context_status_reply_omits_repeated_url():
+    source = bot.InboxContextSource(
+        source_id=8,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video Title",
+        text="[YouTube Transcript]\n본문",
+        remaining_ready_count=0,
+    )
+
+    reply = bot.build_inbox_context_status_reply(source, enhanced=True)
+
+    assert "컨텍스트 적용됨: #8 Video Title" in reply
+    assert "출처:" not in reply
+    assert "본문:" in reply
+    assert "YouTube 원문으로 본문을 보강했습니다." in reply
+    assert "남은 준비된 컨텍스트 큐: 0개" in reply
 
 
 def test_resolve_auto_search_decision_skips_source_local_active_context(monkeypatch):
@@ -830,7 +847,6 @@ def test_handle_message_auto_starts_youtube_audio_transcription_when_enabled(mon
 
     asyncio.run(bot.handle_message(update, None))
 
-    assert session_key(22) not in bot.pending_youtube_transcriptions
     assert update.message.replies == [
         "🎬 스크립트 추출 중...",
         "🎙️ 공개 자막을 가져오지 못해 오디오 전사를 바로 시작합니다.\n"
@@ -854,137 +870,6 @@ def test_youtube_transcript_parse_error_is_audio_fallback_eligible():
 
 def test_youtube_transcript_request_blocked_is_audio_fallback_eligible():
     assert "request_blocked" in bot.YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES
-
-
-def test_handle_message_accepts_pending_youtube_audio_transcription(monkeypatch):
-    calls = []
-
-    async def fake_stream_context_reply(
-        update,
-        user_id,
-        user_message,
-        search_context,
-        source="context",
-        source_kind=None,
-        source_url=None,
-    ):
-        calls.append((user_id, user_message, search_context, source, source_kind, source_url))
-
-    async def fake_worker(update, pending):
-        return {
-            "ok": True,
-            "status": "ok",
-            "message": "transcribed",
-            "content": "[YouTube Transcript]\n전사 본문",
-        }
-
-    key = session_key(23)
-    bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
-        video_id="abcdefghijk",
-        youtube_url="https://youtu.be/abcdefghijk",
-        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
-        user_message="요약",
-        extract_only_requested=False,
-        requested_at=bot.time.time(),
-        failure_status="transcripts_disabled",
-        failure_message="자막 비활성화",
-    )
-    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
-    monkeypatch.setattr(bot, "run_youtube_audio_transcription_worker", fake_worker)
-    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
-    monkeypatch.setattr(bot, "resolve_auto_search_decision", lambda *_args, **_kwargs: bot.AutoSearchDecision(False))
-
-    update = SimpleNamespace(
-        effective_user=SimpleNamespace(id=23),
-        message=DummyMessage(text="1"),
-    )
-
-    asyncio.run(bot.handle_message(update, None))
-
-    assert key not in bot.pending_youtube_transcriptions
-    assert update.message.replies == [
-        "🎙️ 오디오 전사를 시작할게요."
-    ]
-    assert calls == [
-        (
-            23,
-            "요약",
-            "[YouTube Transcript]\n전사 본문",
-            "youtube_audio",
-            "youtube",
-            "https://www.youtube.com/watch?v=abcdefghijk",
-        )
-    ]
-
-
-def test_handle_message_reports_pending_youtube_audio_transcription_failure(monkeypatch):
-    async def fake_worker(update, pending):
-        return {
-            "ok": False,
-            "status": "stalled",
-            "message": "마지막 진행: 6/8",
-        }
-
-    key = session_key(25)
-    bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
-        video_id="abcdefghijk",
-        youtube_url="https://youtu.be/abcdefghijk",
-        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
-        user_message="요약",
-        extract_only_requested=False,
-        requested_at=bot.time.time(),
-        failure_status="transcripts_disabled",
-        failure_message="자막 비활성화",
-    )
-    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
-    monkeypatch.setattr(bot, "run_youtube_audio_transcription_worker", fake_worker)
-
-    update = SimpleNamespace(
-        effective_user=SimpleNamespace(id=25),
-        message=DummyMessage(text="1"),
-    )
-
-    asyncio.run(bot.handle_message(update, None))
-
-    assert key not in bot.pending_youtube_transcriptions
-    assert update.message.replies == [
-        "🎙️ 오디오 전사를 시작할게요.",
-        "⚠️ 오디오 전사를 완료하지 못했습니다.\n상태: stalled\n사유: 마지막 진행: 6/8",
-    ]
-
-
-def test_handle_message_reports_pending_youtube_audio_transcription_exception(monkeypatch):
-    async def fake_worker(update, pending):
-        raise RuntimeError("stdout line exceeds stream limit")
-
-    key = session_key(26)
-    bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
-        video_id="abcdefghijk",
-        youtube_url="https://youtu.be/abcdefghijk",
-        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
-        user_message="요약",
-        extract_only_requested=False,
-        requested_at=bot.time.time(),
-        failure_status="transcripts_disabled",
-        failure_message="자막 비활성화",
-    )
-    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
-    monkeypatch.setattr(bot, "run_youtube_audio_transcription_worker", fake_worker)
-
-    update = SimpleNamespace(
-        effective_user=SimpleNamespace(id=26),
-        message=DummyMessage(text="1"),
-    )
-
-    asyncio.run(bot.handle_message(update, None))
-
-    assert key not in bot.pending_youtube_transcriptions
-    assert update.message.replies == [
-        "🎙️ 오디오 전사를 시작할게요.",
-        "⚠️ 오디오 전사를 완료하지 못했습니다.\n"
-        "상태: worker_exception\n"
-        "사유: stdout line exceeds stream limit",
-    ]
 
 
 def test_run_youtube_audio_transcription_worker_reads_large_final_payload(monkeypatch):
@@ -1067,33 +952,6 @@ def test_run_youtube_audio_transcription_worker_reports_stall(monkeypatch):
     assert result["status"] == "stalled"
     assert "마지막 진행: 6/8" in result["message"]
     assert update.message.replies == ["🎙️ 오디오 전사 진행 중... 6/8"]
-
-
-def test_handle_message_rejects_ambiguous_youtube_audio_confirmation(monkeypatch):
-    key = session_key(24)
-    bot.pending_youtube_transcriptions[key] = bot.PendingYouTubeTranscription(
-        video_id="abcdefghijk",
-        youtube_url="https://youtu.be/abcdefghijk",
-        canonical_youtube_url="https://www.youtube.com/watch?v=abcdefghijk",
-        user_message="요약",
-        extract_only_requested=False,
-        requested_at=bot.time.time(),
-        failure_status="transcripts_disabled",
-        failure_message="자막 비활성화",
-    )
-    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
-
-    update = SimpleNamespace(
-        effective_user=SimpleNamespace(id=24),
-        message=DummyMessage(text="해줘"),
-    )
-
-    asyncio.run(bot.handle_message(update, None))
-
-    assert key not in bot.pending_youtube_transcriptions
-    assert update.message.replies == [
-        "잘 못 알아들어서 전사는 시작하지 않았어요. YouTube URL을 다시 보내면 다시 물어볼게요."
-    ]
 
 
 def test_handle_extract_command_returns_web_text_without_llm(monkeypatch):
@@ -1322,8 +1180,7 @@ def test_handle_inbox_context_enhances_youtube_with_audio_fallback(monkeypatch):
     assert consumed == [14]
     assert update.message.replies == [
         bot.build_inbox_context_processing_reply(source),
-        "🎬 YouTube 컨텍스트를 다시 추출 중...\n출처: https://www.youtube.com/watch?v=abcdefghijk",
-        "🎙️ 공개 자막이 막혀 Inbox YouTube 컨텍스트를 오디오 전사로 보강합니다.",
+        "🎙️ 공개 자막을 가져오지 못해 오디오 전사를 시작합니다.",
         bot.build_inbox_context_status_reply(enhanced_source, enhanced=True),
     ]
     assert stream_calls == [
