@@ -15,11 +15,17 @@ from prompt_profiles import load_prompt_profile, normalize_model_name, render_pr
 
 
 @pytest.fixture(autouse=True)
-def clear_histories():
+def clear_histories(monkeypatch):
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH", False)
     bot.conversations.clear()
     bot.session_histories.clear()
     bot.source_memories.clear()
     bot.active_source_sessions.clear()
+    bot.inbox_context_prefetch_cache.clear()
+    bot.inbox_context_prefetch_inflight.clear()
+    bot.inbox_context_prefetch_tasks.clear()
+    bot.inbox_context_prefetch_task = None
+    bot.inbox_context_ready_list_api_available = None
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
     bot.youtube_audio_transcription_semaphore = None
@@ -28,6 +34,11 @@ def clear_histories():
     bot.session_histories.clear()
     bot.source_memories.clear()
     bot.active_source_sessions.clear()
+    bot.inbox_context_prefetch_cache.clear()
+    bot.inbox_context_prefetch_inflight.clear()
+    bot.inbox_context_prefetch_tasks.clear()
+    bot.inbox_context_prefetch_task = None
+    bot.inbox_context_ready_list_api_available = None
     bot.session_identifiers.clear()
     bot.last_activity_at_by_session.clear()
     bot.youtube_audio_transcription_semaphore = None
@@ -353,6 +364,49 @@ def test_parse_inbox_context_source_payload():
         text="[Web Article]\n본문",
         remaining_ready_count=3,
     )
+
+
+def test_parse_inbox_context_sources_payload():
+    parsed = bot.parse_inbox_context_sources_payload(
+        {
+            "sources": [
+                {
+                    "id": 7,
+                    "kind": "youtube",
+                    "title": "Video",
+                    "url": "https://www.youtube.com/watch?v=abcdefghijk",
+                    "text": "[YouTube Transcript]\n본문",
+                },
+                {
+                    "id": 8,
+                    "kind": "web",
+                    "title": "Article",
+                    "url": "https://example.com/article",
+                    "text": "[Web Article]\n본문",
+                },
+            ],
+            "ready_count": 4,
+        }
+    )
+
+    assert parsed == [
+        bot.InboxContextSource(
+            source_id=7,
+            source_kind="youtube",
+            source_url="https://www.youtube.com/watch?v=abcdefghijk",
+            title="Video",
+            text="[YouTube Transcript]\n본문",
+            remaining_ready_count=3,
+        ),
+        bot.InboxContextSource(
+            source_id=8,
+            source_kind="web",
+            source_url="https://example.com/article",
+            title="Article",
+            text="[Web Article]\n본문",
+            remaining_ready_count=2,
+        ),
+    ]
 
 
 def test_build_inbox_context_applied_reply_includes_summary_and_url():
@@ -1031,6 +1085,65 @@ def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
                 "source_url": "https://example.com/article",
             },
         )
+    ]
+
+
+def test_handle_inbox_context_uses_prefetched_source_and_summary(monkeypatch):
+    consumed = []
+    stream_calls = []
+    source = bot.InboxContextSource(
+        source_id=15,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n짧은 inbox 본문",
+        remaining_ready_count=1,
+    )
+    prefetched_source = bot.InboxContextSource(
+        source_id=15,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n긴 오디오 전사 본문",
+        remaining_ready_count=1,
+    )
+    bot.inbox_context_prefetch_cache[15] = bot.PrefetchedInboxContextSource(
+        source=prefetched_source,
+        enhanced=True,
+        cached_at=bot.time.time(),
+        initial_reply="미리 만든 요약",
+    )
+
+    async def fake_stream_context_reply(*args, **kwargs):
+        stream_calls.append((args, kwargs))
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
+    monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
+    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
+    monkeypatch.setattr(
+        bot,
+        "enhance_inbox_youtube_context_source",
+        lambda *_args, **_kwargs: pytest.fail("prefetched source should skip hydration"),
+    )
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=35),
+        message=DummyMessage(text="/ctx"),
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.handle_inbox_context(update, context))
+
+    key = session_key(35)
+    assert consumed == [15]
+    assert stream_calls == []
+    assert bot.source_memories[key][-1].content == "[YouTube Transcript]\n긴 오디오 전사 본문"
+    assert bot.session_histories[key][-1] == {"role": "assistant", "content": "미리 만든 요약"}
+    assert update.message.replies == [
+        bot.build_inbox_context_processing_reply(source),
+        bot.build_inbox_context_status_reply(prefetched_source, enhanced=True),
+        "미리 만든 요약",
     ]
 
 

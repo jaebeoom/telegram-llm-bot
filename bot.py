@@ -14,7 +14,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlencode, urlparse, urlunparse
 import requests
 from dotenv import load_dotenv
 from tavily import TavilyClient
@@ -169,6 +169,11 @@ conversations: dict[SessionKey, list[ChatMessage]] = {}
 session_histories: dict[SessionKey, list[ChatMessage]] = {}
 source_memories: dict[SessionKey, list[SourceMemory]] = {}
 active_source_sessions: set[SessionKey] = set()
+inbox_context_prefetch_cache: dict[int, PrefetchedInboxContextSource] = {}
+inbox_context_prefetch_inflight: set[int] = set()
+inbox_context_prefetch_tasks: dict[int, asyncio.Task] = {}
+inbox_context_prefetch_task: asyncio.Task | None = None
+inbox_context_ready_list_api_available: bool | None = None
 session_identifiers: dict[SessionKey, str] = {}
 last_activity_at_by_session: dict[SessionKey, float] = {}
 youtube_audio_transcription_semaphore: asyncio.Semaphore | None = None
@@ -373,6 +378,21 @@ INBOX_CONTEXT_PREVIEW_CHARS = parse_positive_int_env(
     "INBOX_CONTEXT_PREVIEW_CHARS",
     700,
 )
+ENABLE_INBOX_CONTEXT_PREFETCH = parse_bool_env("ENABLE_INBOX_CONTEXT_PREFETCH", True)
+ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY = parse_bool_env("ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY", True)
+INBOX_CONTEXT_PREFETCH_TARGET = parse_positive_int_env("INBOX_CONTEXT_PREFETCH_TARGET", 5)
+INBOX_CONTEXT_PREFETCH_INTERVAL_SECONDS = parse_positive_float_env(
+    "INBOX_CONTEXT_PREFETCH_INTERVAL_SECONDS",
+    60.0,
+)
+INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS = parse_positive_float_env(
+    "INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS",
+    6 * 60 * 60,
+)
+INBOX_CONTEXT_PREFETCH_SUMMARY_TIMEOUT_SECONDS = parse_positive_float_env(
+    "INBOX_CONTEXT_PREFETCH_SUMMARY_TIMEOUT_SECONDS",
+    180.0,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -390,10 +410,13 @@ if ENV_FILES_LOADED:
 else:
     logger.warning("No env files were loaded.")
 logger.info(
-    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s youtube_audio_transcription=%s",
+    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s youtube_audio_transcription=%s inbox_context_prefetch=%s target=%s prefetch_summary=%s",
     TELEGRAM_RESPONSE_DELIVERY,
     ENABLE_THINKING_FOR_CONTEXT,
     ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION,
+    ENABLE_INBOX_CONTEXT_PREFETCH,
+    INBOX_CONTEXT_PREFETCH_TARGET,
+    ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY,
 )
 
 
@@ -567,6 +590,14 @@ class InboxContextSource:
     title: str
     text: str
     remaining_ready_count: int
+
+
+@dataclass(frozen=True)
+class PrefetchedInboxContextSource:
+    source: InboxContextSource
+    enhanced: bool
+    cached_at: float
+    initial_reply: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1075,10 +1106,7 @@ def build_inbox_api_headers() -> dict[str, str]:
     return headers
 
 
-def parse_inbox_context_source_payload(data: dict) -> InboxContextSource | None:
-    source = data.get("source")
-    if source is None:
-        return None
+def parse_inbox_context_source_dict(source: dict, remaining_ready_count: int = 0) -> InboxContextSource:
     if not isinstance(source, dict):
         raise ValueError("Inbox context source response was malformed.")
 
@@ -1090,11 +1118,6 @@ def parse_inbox_context_source_payload(data: dict) -> InboxContextSource | None:
     if not isinstance(source_id, int) or not text:
         raise ValueError("Inbox context source response missed id or text.")
 
-    try:
-        remaining_ready_count = int(data.get("remaining_ready_count") or 0)
-    except (TypeError, ValueError):
-        remaining_ready_count = 0
-
     return InboxContextSource(
         source_id=source_id,
         source_kind=source_kind,
@@ -1103,6 +1126,37 @@ def parse_inbox_context_source_payload(data: dict) -> InboxContextSource | None:
         text=text,
         remaining_ready_count=remaining_ready_count,
     )
+
+
+def parse_inbox_context_source_payload(data: dict) -> InboxContextSource | None:
+    source = data.get("source")
+    if source is None:
+        return None
+
+    try:
+        remaining_ready_count = int(data.get("remaining_ready_count") or 0)
+    except (TypeError, ValueError):
+        remaining_ready_count = 0
+
+    return parse_inbox_context_source_dict(source, remaining_ready_count)
+
+
+def parse_inbox_context_sources_payload(data: dict) -> list[InboxContextSource]:
+    sources = data.get("sources")
+    if not isinstance(sources, list):
+        raise ValueError("Inbox context source list response was malformed.")
+
+    ready_count = data.get("ready_count", data.get("remaining_ready_count"))
+    try:
+        total_ready = int(ready_count) if ready_count is not None else len(sources)
+    except (TypeError, ValueError):
+        total_ready = len(sources)
+
+    parsed: list[InboxContextSource] = []
+    for index, source in enumerate(sources):
+        remaining_ready_count = max(total_ready - index - 1, 0)
+        parsed.append(parse_inbox_context_source_dict(source, remaining_ready_count))
+    return parsed
 
 
 def fetch_next_inbox_context_source() -> InboxContextSource | None:
@@ -1117,6 +1171,43 @@ def fetch_next_inbox_context_source() -> InboxContextSource | None:
     )
     response.raise_for_status()
     return parse_inbox_context_source_payload(response.json())
+
+
+def fetch_ready_inbox_context_sources(limit: int) -> list[InboxContextSource] | None:
+    global inbox_context_ready_list_api_available
+
+    if inbox_context_ready_list_api_available is False:
+        return None
+
+    url = build_inbox_api_url("/api/context-sources/ready")
+    if not url:
+        raise ValueError("INBOX_API_BASE_URL is empty.")
+
+    response = requests.get(
+        f"{url}?{urlencode({'limit': max(1, limit)})}",
+        headers=build_inbox_api_headers(),
+        timeout=INBOX_API_TIMEOUT_SECONDS,
+    )
+    if response.status_code in {404, 405}:
+        inbox_context_ready_list_api_available = False
+        logger.info("Inbox context ready list API is unavailable; falling back to /next prefetch.")
+        return None
+
+    response.raise_for_status()
+    inbox_context_ready_list_api_available = True
+    return parse_inbox_context_sources_payload(response.json())
+
+
+def fetch_prefetchable_inbox_context_sources(limit: int) -> list[InboxContextSource]:
+    if limit <= 0:
+        return []
+
+    ready_sources = fetch_ready_inbox_context_sources(limit)
+    if ready_sources is not None:
+        return ready_sources[:limit]
+
+    source = fetch_next_inbox_context_source()
+    return [source] if source is not None else []
 
 
 def mark_inbox_context_source_consumed(source_id: int) -> None:
@@ -1192,6 +1283,45 @@ def summarize_inbox_context_source(source: InboxContextSource) -> str:
     if not summary:
         raise ValueError("summary response was empty")
     return summary
+
+
+def generate_inbox_context_initial_reply(source: InboxContextSource) -> str:
+    messages = [
+        {"role": "system", "content": build_system_prompt(MODEL_NAME)},
+        {
+            "role": "user",
+            "content": build_augmented_context_message(
+                build_context_prompt(DEFAULT_CONTEXT_PROMPT),
+                source.text,
+            ),
+        },
+    ]
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "stream": False,
+    }
+    if source.text and not ENABLE_THINKING_FOR_CONTEXT:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    response = requests.post(
+        build_chat_completions_url(),
+        headers=build_llm_headers(),
+        json=payload,
+        timeout=INBOX_CONTEXT_PREFETCH_SUMMARY_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise ValueError("initial context reply missing message content")
+
+    reply = normalize_response_text(str(content))
+    if not reply:
+        raise ValueError("initial context reply was empty")
+    return reply
 
 
 def build_inbox_context_preview(source: InboxContextSource) -> str:
@@ -2060,6 +2190,42 @@ def log_stage_metrics(
     )
 
 
+async def update_status_message(update: Update | None, status_message, text: str):
+    text = text[:TELEGRAM_TEXT_LIMIT]
+    if status_message is not None:
+        try:
+            await status_message.edit_text(text)
+            return status_message
+        except BadRequest as exc:
+            if "Message is not modified" in str(exc):
+                return status_message
+            logger.debug("status message edit failed; falling back to a new status message: %s", exc)
+        except Exception as exc:
+            logger.debug("status message edit failed; falling back to a new status message: %s", exc)
+
+    if update is None or not getattr(update, "message", None):
+        return status_message
+    return await update.message.reply_text(text)
+
+
+def build_context_ready_status(
+    source_kind: str,
+    content: str,
+    *,
+    extract_only_requested: bool = False,
+    note: str = "",
+) -> str:
+    label = SOURCE_KIND_LABELS.get(source_kind, source_kind)
+    lines = [
+        f"컨텍스트 준비 완료: {label}",
+        f"본문: {len(content):,}자",
+    ]
+    if note:
+        lines.append(f"참고: {note}")
+    lines.append("원문 전송 중..." if extract_only_requested else "답변 생성 중...")
+    return "\n".join(lines)
+
+
 async def extract_context_from_user_text(
     update: Update,
     user_id: int,
@@ -2304,9 +2470,16 @@ def build_youtube_audio_failure_reply(result: dict) -> str:
     return f"⚠️ 오디오 전사를 완료하지 못했습니다.\n상태: {status}\n사유: {reason}"
 
 
+async def maybe_reply_text(update: Update | None, text: str) -> None:
+    if update is None or not getattr(update, "message", None):
+        return
+    await update.message.reply_text(text)
+
+
 async def run_youtube_audio_transcription_worker(
-    update: Update,
+    update: Update | None,
     pending: PendingYouTubeTranscription,
+    status_message=None,
 ) -> dict:
     process = await asyncio.create_subprocess_exec(
         *youtube_audio_worker_command("transcribe", pending.video_id),
@@ -2363,7 +2536,11 @@ async def run_youtube_audio_transcription_worker(
                 total = int(payload.get("total") or 0)
                 if current and total and (current, total) != last_progress:
                     last_progress = (current, total)
-                    await update.message.reply_text(f"🎙️ 오디오 전사 진행 중... {current}/{total}")
+                    progress_text = f"🎙️ 오디오 전사 진행 중... {current}/{total}"
+                    if status_message is not None:
+                        await update_status_message(update, status_message, progress_text)
+                    else:
+                        await maybe_reply_text(update, progress_text)
                 continue
             if "ok" in payload:
                 result_payload = payload
@@ -2390,19 +2567,20 @@ async def run_youtube_audio_transcription_worker(
 
 
 async def execute_youtube_audio_transcription(
-    update: Update,
+    update: Update | None,
     pending: PendingYouTubeTranscription,
+    status_message=None,
 ) -> tuple[dict, int]:
     started_at = asyncio.get_running_loop().time()
     try:
         async with get_youtube_audio_transcription_semaphore():
             if YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS > 0:
                 result = await asyncio.wait_for(
-                    run_youtube_audio_transcription_worker(update, pending),
+                    run_youtube_audio_transcription_worker(update, pending, status_message=status_message),
                     timeout=YOUTUBE_AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS,
                 )
             else:
-                result = await run_youtube_audio_transcription_worker(update, pending)
+                result = await run_youtube_audio_transcription_worker(update, pending, status_message=status_message)
     except asyncio.TimeoutError:
         result = {
             "ok": False,
@@ -2421,7 +2599,7 @@ async def execute_youtube_audio_transcription(
 
 
 async def enhance_inbox_youtube_context_source(
-    update: Update,
+    update: Update | None,
     user_id: int,
     source: InboxContextSource,
 ) -> tuple[InboxContextSource, bool]:
@@ -2455,7 +2633,7 @@ async def enhance_inbox_youtube_context_source(
     )
     if yt_context:
         if yt_result.message:
-            await update.message.reply_text(f"ℹ️ {yt_result.message}")
+            await maybe_reply_text(update, f"ℹ️ {yt_result.message}")
         logger.info(
             "Inbox YouTube context enhanced from transcript source_id=%s video_id=%s original_chars=%s enhanced_chars=%s status=%s method=%s",
             source.source_id,
@@ -2478,7 +2656,8 @@ async def enhance_inbox_youtube_context_source(
     )
     if pending is None:
         if fallback_issue:
-            await update.message.reply_text(
+            await maybe_reply_text(
+                update,
                 f"ℹ️ YouTube 원문 보강은 건너뜁니다: {fallback_issue}\n"
                 "먼저 읽어둔 본문을 사용합니다."
             )
@@ -2492,7 +2671,7 @@ async def enhance_inbox_youtube_context_source(
         )
         return replace(source, source_url=canonical_url), False
 
-    await update.message.reply_text("🎙️ 공개 자막을 가져오지 못해 오디오 전사를 시작합니다.")
+    await maybe_reply_text(update, "🎙️ 공개 자막을 가져오지 못해 오디오 전사를 시작합니다.")
     result, elapsed_ms = await execute_youtube_audio_transcription(update, pending)
     content = result.get("content") if isinstance(result.get("content"), str) else ""
     log_stage_metrics(
@@ -2505,7 +2684,8 @@ async def enhance_inbox_youtube_context_source(
         chars=len(content),
     )
     if not result.get("ok") or not content:
-        await update.message.reply_text(
+        await maybe_reply_text(
+            update,
             f"{build_youtube_audio_failure_reply(result)}\n\n"
             "먼저 읽어둔 본문을 대신 사용합니다."
         )
@@ -2528,6 +2708,170 @@ async def enhance_inbox_youtube_context_source(
         result.get("cached"),
     )
     return replace(source, text=content, source_url=canonical_url), True
+
+
+def purge_stale_inbox_context_prefetch_cache(now: float | None = None) -> None:
+    if not inbox_context_prefetch_cache:
+        return
+    current_time = now if now is not None else time.time()
+    expired_source_ids = [
+        source_id
+        for source_id, cached in inbox_context_prefetch_cache.items()
+        if current_time - cached.cached_at > INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS
+    ]
+    for source_id in expired_source_ids:
+        inbox_context_prefetch_cache.pop(source_id, None)
+
+
+def pop_prefetched_inbox_context_source(source: InboxContextSource) -> PrefetchedInboxContextSource | None:
+    purge_stale_inbox_context_prefetch_cache()
+    cached = inbox_context_prefetch_cache.pop(source.source_id, None)
+    if cached is None:
+        return None
+    cached_source = replace(cached.source, remaining_ready_count=source.remaining_ready_count)
+    return replace(cached, source=cached_source)
+
+
+async def _prefetch_inbox_context_source(source: InboxContextSource, *, reason: str) -> None:
+    source_id = source.source_id
+    if source_id in inbox_context_prefetch_cache:
+        return
+
+    inbox_context_prefetch_inflight.add(source_id)
+    original_chars = len(source.text)
+    try:
+        hydrated_source, enhanced = await enhance_inbox_youtube_context_source(None, 0, source)
+        initial_reply: str | None = None
+        if ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY:
+            try:
+                initial_reply = await asyncio.to_thread(generate_inbox_context_initial_reply, hydrated_source)
+            except Exception as exc:
+                logger.warning(
+                    "Inbox context prefetch summary failed source_id=%s kind=%s reason=%s: %s",
+                    source_id,
+                    hydrated_source.source_kind,
+                    reason,
+                    exc,
+                )
+
+        inbox_context_prefetch_cache[source_id] = PrefetchedInboxContextSource(
+            source=hydrated_source,
+            enhanced=enhanced,
+            cached_at=time.time(),
+            initial_reply=initial_reply,
+        )
+        logger.info(
+            "Inbox context prefetched source_id=%s kind=%s url=%s chars=%s original_chars=%s enhanced=%s summary=%s reason=%s",
+            source_id,
+            hydrated_source.source_kind,
+            hydrated_source.source_url or "",
+            len(hydrated_source.text),
+            original_chars,
+            enhanced,
+            bool(initial_reply),
+            reason,
+        )
+    except Exception as exc:
+        logger.warning("Inbox context prefetch failed source_id=%s reason=%s: %s", source_id, reason, exc)
+    finally:
+        inbox_context_prefetch_inflight.discard(source_id)
+        current_task = asyncio.current_task()
+        if inbox_context_prefetch_tasks.get(source_id) is current_task:
+            inbox_context_prefetch_tasks.pop(source_id, None)
+
+
+def ensure_inbox_context_source_prefetch_task(
+    source: InboxContextSource,
+    *,
+    reason: str,
+) -> asyncio.Task | None:
+    source_id = source.source_id
+    if source_id in inbox_context_prefetch_cache:
+        return None
+
+    existing_task = inbox_context_prefetch_tasks.get(source_id)
+    if existing_task is not None and not existing_task.done():
+        return existing_task
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+    task = loop.create_task(_prefetch_inbox_context_source(source, reason=reason))
+    inbox_context_prefetch_tasks[source_id] = task
+    return task
+
+
+async def prefetch_inbox_context_sources(*, reason: str = "scheduled") -> None:
+    if not ENABLE_INBOX_CONTEXT_PREFETCH or INBOX_CONTEXT_PREFETCH_TARGET <= 0:
+        return
+
+    purge_stale_inbox_context_prefetch_cache()
+    capacity = INBOX_CONTEXT_PREFETCH_TARGET - len(inbox_context_prefetch_cache) - len(inbox_context_prefetch_tasks)
+    if capacity <= 0:
+        return
+
+    try:
+        sources = await asyncio.to_thread(
+            fetch_prefetchable_inbox_context_sources,
+            INBOX_CONTEXT_PREFETCH_TARGET,
+        )
+    except Exception as exc:
+        logger.warning("Inbox context prefetch source fetch failed reason=%s: %s", reason, exc)
+        return
+
+    tasks: list[asyncio.Task] = []
+    for source in sources:
+        if len(inbox_context_prefetch_cache) + len(inbox_context_prefetch_tasks) >= INBOX_CONTEXT_PREFETCH_TARGET:
+            break
+        if source.source_id in inbox_context_prefetch_cache:
+            continue
+        task = ensure_inbox_context_source_prefetch_task(source, reason=reason)
+        if task is not None:
+            tasks.append(task)
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def start_inbox_context_prefetch(reason: str = "manual") -> None:
+    global inbox_context_prefetch_task
+
+    if not ENABLE_INBOX_CONTEXT_PREFETCH:
+        return
+    if inbox_context_prefetch_task is not None and not inbox_context_prefetch_task.done():
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    inbox_context_prefetch_task = loop.create_task(prefetch_inbox_context_sources(reason=reason))
+
+
+async def run_inbox_context_prefetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await prefetch_inbox_context_sources(reason="scheduled")
+
+
+def append_prefetched_inbox_context_reply_to_history(
+    session_key: SessionKey,
+    source: InboxContextSource,
+    final_text: str,
+) -> None:
+    augmented_message = build_augmented_context_message(
+        build_context_prompt(DEFAULT_CONTEXT_PROMPT),
+        source.text,
+    )
+    append_history_message(
+        session_key,
+        "user",
+        augmented_message,
+        source_kind=source.source_kind,
+        source_url=source.source_url,
+    )
+    append_history_message(session_key, "assistant", final_text)
 
 
 async def send_message_draft(update: Update, draft_id: int, text: str) -> bool:
@@ -2700,6 +3044,24 @@ def build_source_followup_message(user_message: str) -> str:
     )
 
 
+def build_augmented_context_message(user_message: str, search_context: str) -> str:
+    if not search_context:
+        return user_message
+    return (
+        f"{search_context}\n\n"
+        f"[Response Rules]\n"
+        f"- 반드시 한국어로만 답하세요.\n"
+        f"- 원문 언어가 영어, 중국어, 일본어 또는 다른 언어여도 한국어로 번역, 요약, 설명하세요.\n"
+        f"- 사용자가 명시적으로 원문 인용을 요청한 경우가 아니라면 중국어/일본어 문자를 출력하지 마세요.\n"
+        f"- 사용자가 영어 답변을 명시적으로 요청한 경우에만 영어로 답하세요.\n"
+        f"- Treat the provided context/search results as authoritative for current facts.\n"
+        f"- If the provided context conflicts with your internal memory, prefer the provided context.\n"
+        f"- Do not assert current facts that are not supported by the provided context; say they are unverified.\n"
+        f"- For current-event, product, company, market, or investment answers, separate verified facts from analysis and unresolved uncertainties.\n\n"
+        f"[User Question]\n{user_message}"
+    )
+
+
 def append_history_message(
     session_key: SessionKey,
     role: str,
@@ -2734,19 +3096,7 @@ def prepare_messages(
 ) -> list:
 
     if search_context:
-        augmented_message = (
-            f"{search_context}\n\n"
-            f"[Response Rules]\n"
-            f"- 반드시 한국어로만 답하세요.\n"
-            f"- 원문 언어가 영어, 중국어, 일본어 또는 다른 언어여도 한국어로 번역, 요약, 설명하세요.\n"
-            f"- 사용자가 명시적으로 원문 인용을 요청한 경우가 아니라면 중국어/일본어 문자를 출력하지 마세요.\n"
-            f"- 사용자가 영어 답변을 명시적으로 요청한 경우에만 영어로 답하세요.\n"
-            f"- Treat the provided context/search results as authoritative for current facts.\n"
-            f"- If the provided context conflicts with your internal memory, prefer the provided context.\n"
-            f"- Do not assert current facts that are not supported by the provided context; say they are unverified.\n"
-            f"- For current-event, product, company, market, or investment answers, separate verified facts from analysis and unresolved uncertainties.\n\n"
-            f"[User Question]\n{user_message}"
-        )
+        augmented_message = build_augmented_context_message(user_message, search_context)
     else:
         augmented_message = user_message
     apply_source_followup = not search_context and should_apply_source_followup_rules(session_key, user_message)
@@ -3449,7 +3799,34 @@ async def handle_inbox_context_with_typing(update: Update, user_id: int):
 
     await update.message.reply_text(build_inbox_context_processing_reply(source))
     original_chars = len(source.text)
-    source, enhanced = await enhance_inbox_youtube_context_source(update, user_id, source)
+    cached_source = pop_prefetched_inbox_context_source(source)
+    cached_initial_reply: str | None = None
+    if cached_source is not None:
+        source = cached_source.source
+        enhanced = cached_source.enhanced
+        cached_initial_reply = cached_source.initial_reply
+        logger.info(
+            "Inbox context using prefetched source source_id=%s kind=%s enhanced=%s summary=%s",
+            source.source_id,
+            source.source_kind,
+            enhanced,
+            bool(cached_initial_reply),
+        )
+    else:
+        prefetch_task = inbox_context_prefetch_tasks.get(source.source_id)
+        if prefetch_task is not None and not prefetch_task.done():
+            await update.message.reply_text("미리 처리 중인 컨텍스트를 마무리하는 중입니다.")
+            with suppress(Exception):
+                await prefetch_task
+            cached_source = pop_prefetched_inbox_context_source(source)
+            if cached_source is not None:
+                source = cached_source.source
+                enhanced = cached_source.enhanced
+                cached_initial_reply = cached_source.initial_reply
+            else:
+                source, enhanced = await enhance_inbox_youtube_context_source(update, user_id, source)
+        else:
+            source, enhanced = await enhance_inbox_youtube_context_source(update, user_id, source)
 
     try:
         apply_inbox_context_source_to_session(current_session_key, source)
@@ -3479,15 +3856,27 @@ async def handle_inbox_context_with_typing(update: Update, user_id: int):
         source.remaining_ready_count,
     )
     await update.message.reply_text(build_inbox_context_status_reply(source, enhanced=enhanced))
-    await stream_context_reply(
-        update,
-        user_id,
-        DEFAULT_CONTEXT_PROMPT,
-        source.text,
-        source="inbox_context",
-        source_kind=source.source_kind,
-        source_url=source.source_url,
-    )
+    start_inbox_context_prefetch("after_ctx")
+
+    if cached_initial_reply:
+        final_text = await validate_and_rewrite_response(
+            cached_initial_reply,
+            build_context_prompt(DEFAULT_CONTEXT_PROMPT),
+            source.text,
+        )
+        for chunk in chunk_text(final_text):
+            await update.message.reply_text(chunk)
+        append_prefetched_inbox_context_reply_to_history(current_session_key, source, final_text)
+    else:
+        await stream_context_reply(
+            update,
+            user_id,
+            DEFAULT_CONTEXT_PROMPT,
+            source.text,
+            source="inbox_context",
+            source_kind=source.source_kind,
+            source_url=source.source_url,
+        )
 
 
 async def handle_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3626,6 +4015,15 @@ def main():
     app.add_handler(CommandHandler("m", show_model))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    if ENABLE_INBOX_CONTEXT_PREFETCH and app.job_queue is not None:
+        app.job_queue.run_once(run_inbox_context_prefetch_job, when=5, name="inbox-context-prefetch-startup")
+        app.job_queue.run_repeating(
+            run_inbox_context_prefetch_job,
+            interval=INBOX_CONTEXT_PREFETCH_INTERVAL_SECONDS,
+            first=INBOX_CONTEXT_PREFETCH_INTERVAL_SECONDS,
+            name="inbox-context-prefetch",
+        )
 
     logger.info("Bot started!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
