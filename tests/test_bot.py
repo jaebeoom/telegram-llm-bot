@@ -712,7 +712,12 @@ def test_handle_message_with_youtube_share_url_uses_canonical_source(monkeypatch
             "https://www.youtube.com/watch?v=abcdefghijk",
         )
     ]
-    assert update.message.replies[0] == "🎬 스크립트 추출 중..."
+    assert update.message.replies[0] == "🎬 YouTube 스크립트 확인 중..."
+    assert update.message.reply_messages[0].text == (
+        "컨텍스트 준비 완료: YouTube\n"
+        "본문: 23자\n"
+        "답변 생성 중..."
+    )
 
 
 def test_handle_message_with_extract_suffix_returns_youtube_transcript_without_llm(monkeypatch):
@@ -739,9 +744,14 @@ def test_handle_message_with_extract_suffix_returns_youtube_transcript_without_l
     asyncio.run(bot.handle_message(update, None))
 
     assert update.message.replies == [
-        "🎬 스크립트 추출 중...",
+        "🎬 YouTube 스크립트 확인 중...",
         "YouTube 스크립트\n\n원문 본문",
     ]
+    assert update.message.reply_messages[0].text == (
+        "컨텍스트 준비 완료: YouTube\n"
+        "본문: 26자\n"
+        "원문 전송 중..."
+    )
     assert bot.conversations.get(session_key(18)) is None
     assert bot.session_histories[session_key(18)][-1] == {
         "role": "assistant",
@@ -773,7 +783,7 @@ def test_handle_message_with_e_suffix_returns_youtube_transcript_without_llm(mon
     asyncio.run(bot.handle_message(update, None))
 
     assert update.message.replies == [
-        "🎬 스크립트 추출 중...",
+        "🎬 YouTube 스크립트 확인 중...",
         "YouTube 스크립트\n\n원문 본문",
     ]
 
@@ -802,10 +812,15 @@ def test_handle_message_reports_youtube_transcript_success_notice(monkeypatch):
     asyncio.run(bot.handle_message(update, None))
 
     assert update.message.replies == [
-        "🎬 스크립트 추출 중...",
-        "ℹ️ YouTube가 한국어 번역 자막 요청을 차단해 원본 자막을 사용했습니다.",
+        "🎬 YouTube 스크립트 확인 중...",
         "YouTube 스크립트\n\n원본 영어 자막",
     ]
+    assert update.message.reply_messages[0].text == (
+        "컨텍스트 준비 완료: YouTube\n"
+        "본문: 29자\n"
+        "참고: YouTube가 한국어 번역 자막 요청을 차단해 원본 자막을 사용했습니다.\n"
+        "원문 전송 중..."
+    )
 
 
 def test_handle_message_reports_specific_youtube_transcript_failure(monkeypatch):
@@ -832,19 +847,18 @@ def test_handle_message_reports_specific_youtube_transcript_failure(monkeypatch)
 
     asyncio.run(bot.handle_message(update, None))
 
-    assert update.message.replies == [
-        "🎬 스크립트 추출 중...",
-        "⚠️ 이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다.",
-    ]
+    assert update.message.replies == ["🎬 YouTube 스크립트 확인 중..."]
+    assert update.message.reply_messages[0].text == "⚠️ 이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다."
 
 
 def test_handle_message_auto_starts_youtube_audio_transcription_when_enabled(monkeypatch):
     calls = []
 
-    async def fake_execute_youtube_audio_transcription(update, pending):
+    async def fake_execute_youtube_audio_transcription(update, pending, status_message=None):
         assert pending.video_id == "abcdefghijk"
         assert pending.user_message == "요약"
         assert pending.duration == 5400
+        assert status_message is not None
         return (
             {
                 "ok": True,
@@ -901,11 +915,12 @@ def test_handle_message_auto_starts_youtube_audio_transcription_when_enabled(mon
 
     asyncio.run(bot.handle_message(update, None))
 
-    assert update.message.replies == [
-        "🎬 스크립트 추출 중...",
-        "🎙️ 공개 자막을 가져오지 못해 오디오 전사를 바로 시작합니다.\n"
-        "사유: 이 영상은 YouTube에서 공개 스크립트/자막이 비활성화되어 있습니다.",
-    ]
+    assert update.message.replies == ["🎬 YouTube 스크립트 확인 중..."]
+    assert update.message.reply_messages[0].text == (
+        "컨텍스트 준비 완료: YouTube\n"
+        "본문: 26자\n"
+        "답변 생성 중..."
+    )
     assert calls == [
         (
             22,

@@ -2237,7 +2237,7 @@ async def extract_context_from_user_text(
     tweet_match = TWEET_URL_PATTERN.search(user_text)
     if tweet_match:
         tweet_url = find_matching_url(user_text, TWEET_URL_PATTERN) or tweet_match.group(0)
-        await update.message.reply_text("📰 X 피드 읽는 중...")
+        status_message = await update_status_message(update, None, "📰 X 피드 읽는 중...")
         stage_started_at = asyncio.get_running_loop().time()
         tweet_context = await asyncio.to_thread(extract_tweet_from_url, tweet_url)
         log_stage_metrics(
@@ -2250,9 +2250,14 @@ async def extract_context_from_user_text(
             chars=len(tweet_context) if tweet_context else 0,
         )
         if not tweet_context:
-            await update.message.reply_text("⚠️ 피드를 가져올 수 없습니다.")
+            await update_status_message(update, status_message, "⚠️ 피드를 가져올 수 없습니다.")
             return ContextExtractionResult(matched=True)
 
+        await update_status_message(
+            update,
+            status_message,
+            build_context_ready_status("x", tweet_context, extract_only_requested=extract_only_requested),
+        )
         return ContextExtractionResult(
             matched=True,
             extracted=ExtractedContext(
@@ -2269,7 +2274,7 @@ async def extract_context_from_user_text(
         video_id = yt_match.group(1)
         youtube_url = find_matching_url(user_text, YOUTUBE_URL_PATTERN) or yt_match.group(0)
         canonical_youtube_url = normalize_source_url(youtube_url, "youtube")
-        await update.message.reply_text("🎬 스크립트 추출 중...")
+        status_message = await update_status_message(update, None, "🎬 YouTube 스크립트 확인 중...")
         stage_started_at = asyncio.get_running_loop().time()
         yt_result = await asyncio.to_thread(extract_youtube_transcript_result, video_id)
         yt_context = yt_result.content
@@ -2302,8 +2307,16 @@ async def extract_context_from_user_text(
                     yt_result.status,
                     failure_message,
                 )
-                await update.message.reply_text(build_youtube_auto_transcription_start_reply(pending))
-                result, elapsed_ms = await execute_youtube_audio_transcription(update, pending)
+                status_message = await update_status_message(
+                    update,
+                    status_message,
+                    build_youtube_auto_transcription_start_reply(pending),
+                )
+                result, elapsed_ms = await execute_youtube_audio_transcription(
+                    update,
+                    pending,
+                    status_message=status_message,
+                )
                 content = result.get("content") if isinstance(result.get("content"), str) else ""
                 log_stage_metrics(
                     "youtube_audio_transcription",
@@ -2315,8 +2328,17 @@ async def extract_context_from_user_text(
                     chars=len(content),
                 )
                 if not result.get("ok") or not content:
-                    await update.message.reply_text(build_youtube_audio_failure_reply(result))
+                    await update_status_message(update, status_message, build_youtube_audio_failure_reply(result))
                     return ContextExtractionResult(matched=True)
+                await update_status_message(
+                    update,
+                    status_message,
+                    build_context_ready_status(
+                        "youtube",
+                        content,
+                        extract_only_requested=extract_only_requested,
+                    ),
+                )
                 return ContextExtractionResult(
                     matched=True,
                     extracted=ExtractedContext(
@@ -2328,13 +2350,21 @@ async def extract_context_from_user_text(
                     ),
                 )
             if fallback_issue and ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION:
-                await update.message.reply_text(f"⚠️ {failure_message}\n\n{fallback_issue}")
+                await update_status_message(update, status_message, f"⚠️ {failure_message}\n\n{fallback_issue}")
                 return ContextExtractionResult(matched=True)
-            await update.message.reply_text(f"⚠️ {failure_message}")
+            await update_status_message(update, status_message, f"⚠️ {failure_message}")
             return ContextExtractionResult(matched=True)
 
-        if yt_result.message:
-            await update.message.reply_text(f"ℹ️ {yt_result.message}")
+        await update_status_message(
+            update,
+            status_message,
+            build_context_ready_status(
+                "youtube",
+                yt_context,
+                extract_only_requested=extract_only_requested,
+                note=yt_result.message,
+            ),
+        )
 
         return ContextExtractionResult(
             matched=True,
@@ -2355,7 +2385,7 @@ async def extract_context_from_user_text(
     user_msg = remove_url_once(user_text, url)
 
     if url.lower().endswith(".pdf"):
-        await update.message.reply_text("📄 PDF 다운로드 중...")
+        status_message = await update_status_message(update, None, "📄 PDF 다운로드 중...")
         stage_started_at = asyncio.get_running_loop().time()
         pdf_context = await asyncio.to_thread(extract_pdf_from_url, url)
         log_stage_metrics(
@@ -2368,9 +2398,14 @@ async def extract_context_from_user_text(
             chars=len(pdf_context) if pdf_context else 0,
         )
         if not pdf_context:
-            await update.message.reply_text("⚠️ PDF에서 텍스트를 추출할 수 없습니다.")
+            await update_status_message(update, status_message, "⚠️ PDF에서 텍스트를 추출할 수 없습니다.")
             return ContextExtractionResult(matched=True)
 
+        await update_status_message(
+            update,
+            status_message,
+            build_context_ready_status("pdf", pdf_context, extract_only_requested=extract_only_requested),
+        )
         return ContextExtractionResult(
             matched=True,
             extracted=ExtractedContext(
@@ -2382,7 +2417,7 @@ async def extract_context_from_user_text(
             ),
         )
 
-    await update.message.reply_text("📖 웹페이지 읽는 중...")
+    status_message = await update_status_message(update, None, "📖 웹페이지 읽는 중...")
     stage_started_at = asyncio.get_running_loop().time()
     web_result = await asyncio.to_thread(extract_web_result, url)
     log_stage_metrics(
@@ -2396,9 +2431,18 @@ async def extract_context_from_user_text(
         method=web_result.method if web_result else None,
     )
     if not web_result:
-        await update.message.reply_text("⚠️ 웹페이지에서 텍스트를 추출할 수 없습니다. (일부 JavaScript/iframe 기반 페이지는 여전히 지원되지 않을 수 있어요)")
+        await update_status_message(
+            update,
+            status_message,
+            "⚠️ 웹페이지에서 텍스트를 추출할 수 없습니다. (일부 JavaScript/iframe 기반 페이지는 여전히 지원되지 않을 수 있어요)",
+        )
         return ContextExtractionResult(matched=True)
 
+    await update_status_message(
+        update,
+        status_message,
+        build_context_ready_status("web", web_result.content, extract_only_requested=extract_only_requested),
+    )
     return ContextExtractionResult(
         matched=True,
         extracted=ExtractedContext(
