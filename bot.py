@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import hashlib
 import json
 import logging
 import sys
@@ -30,6 +31,10 @@ from telegram.ext import (
 )
 from tagger import generate_tags
 from prompt_profiles import render_prompt_profile
+from inbox_prefetch_cache import (
+    InboxPrefetchPersistentCache,
+    PersistentInboxPrefetchRecord,
+)
 from extractors import (
     TWEET_URL_PATTERN,
     YOUTUBE_URL_PATTERN,
@@ -341,6 +346,17 @@ def parse_positive_int_env(name: str, default: int) -> int:
     return parsed
 
 
+def parse_optional_path_env(name: str, default: str | None = None) -> str | None:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        raw_value = default
+    if raw_value is None:
+        return None
+
+    parsed = raw_value.strip()
+    return parsed or None
+
+
 AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS = parse_positive_float_env(
     "AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS",
     12.0,
@@ -389,6 +405,10 @@ INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS = parse_positive_float_env(
     "INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS",
     6 * 60 * 60,
 )
+INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH = parse_optional_path_env(
+    "INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH",
+    ".cache/inbox-context-prefetch.sqlite3",
+)
 INBOX_CONTEXT_PREFETCH_SUMMARY_TIMEOUT_SECONDS = parse_positive_float_env(
     "INBOX_CONTEXT_PREFETCH_SUMMARY_TIMEOUT_SECONDS",
     180.0,
@@ -410,13 +430,14 @@ if ENV_FILES_LOADED:
 else:
     logger.warning("No env files were loaded.")
 logger.info(
-    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s youtube_audio_transcription=%s inbox_context_prefetch=%s target=%s prefetch_summary=%s",
+    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s youtube_audio_transcription=%s inbox_context_prefetch=%s target=%s prefetch_summary=%s persistent_prefetch_cache=%s",
     TELEGRAM_RESPONSE_DELIVERY,
     ENABLE_THINKING_FOR_CONTEXT,
     ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION,
     ENABLE_INBOX_CONTEXT_PREFETCH,
     INBOX_CONTEXT_PREFETCH_TARGET,
     ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY,
+    bool(INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH),
 )
 
 
@@ -598,6 +619,7 @@ class PrefetchedInboxContextSource:
     enhanced: bool
     cached_at: float
     initial_reply: str | None = None
+    original_source: InboxContextSource | None = None
 
 
 @dataclass(frozen=True)
@@ -1222,6 +1244,140 @@ def mark_inbox_context_source_consumed(source_id: int) -> None:
         timeout=INBOX_API_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
+
+
+def get_inbox_context_prefetch_persistent_cache() -> InboxPrefetchPersistentCache:
+    return InboxPrefetchPersistentCache(
+        raw_path=INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH,
+        ttl_seconds=INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS,
+        base_dir=Path(__file__).resolve().parent,
+        logger=logger,
+    )
+
+
+def resolve_inbox_context_prefetch_persistent_cache_path() -> Path | None:
+    return get_inbox_context_prefetch_persistent_cache().resolve_path()
+
+
+def serialize_inbox_context_source(source: InboxContextSource) -> str:
+    return json.dumps(
+        {
+            "id": source.source_id,
+            "kind": source.source_kind,
+            "url": source.source_url,
+            "title": source.title,
+            "text": source.text,
+            "remaining_ready_count": source.remaining_ready_count,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def deserialize_inbox_context_source(payload: str) -> InboxContextSource:
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("serialized inbox context source must decode to a dict")
+    try:
+        remaining_ready_count = int(data.get("remaining_ready_count") or 0)
+    except (TypeError, ValueError):
+        remaining_ready_count = 0
+    return parse_inbox_context_source_dict(data, remaining_ready_count)
+
+
+def build_inbox_context_prefetch_summary_signature() -> str:
+    signature_payload = {
+        "model_name": MODEL_NAME,
+        "system_prompt": build_system_prompt(MODEL_NAME),
+        "context_prompt": build_context_prompt(DEFAULT_CONTEXT_PROMPT),
+        "enable_thinking_for_context": ENABLE_THINKING_FOR_CONTEXT,
+        "summary_enabled": ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY,
+    }
+    return hashlib.sha256(
+        json.dumps(signature_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def build_prefetched_inbox_context_source(
+    original_source: InboxContextSource,
+    hydrated_source: InboxContextSource,
+    *,
+    enhanced: bool,
+    initial_reply: str | None,
+    cached_at: float | None = None,
+) -> PrefetchedInboxContextSource:
+    return PrefetchedInboxContextSource(
+        source=hydrated_source,
+        enhanced=enhanced,
+        cached_at=time.time() if cached_at is None else cached_at,
+        initial_reply=initial_reply,
+        original_source=original_source,
+    )
+
+
+def inbox_context_sources_match(left: InboxContextSource, right: InboxContextSource) -> bool:
+    return (
+        left.source_id == right.source_id
+        and left.source_kind == right.source_kind
+        and (left.source_url or "") == (right.source_url or "")
+        and left.title == right.title
+        and left.text == right.text
+    )
+
+
+def prefetched_inbox_context_source_matches(
+    source: InboxContextSource,
+    cached: PrefetchedInboxContextSource,
+) -> bool:
+    original_source = cached.original_source or cached.source
+    return inbox_context_sources_match(source, original_source)
+
+
+def load_persistent_prefetched_inbox_context_source(source_id: int) -> PrefetchedInboxContextSource | None:
+    record = get_inbox_context_prefetch_persistent_cache().load(source_id)
+    if record is None:
+        return None
+
+    initial_reply = record.initial_reply
+    if initial_reply and (
+        not ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY
+        or record.summary_signature != build_inbox_context_prefetch_summary_signature()
+    ):
+        initial_reply = None
+
+    return PrefetchedInboxContextSource(
+        source=deserialize_inbox_context_source(record.hydrated_source_json),
+        enhanced=record.enhanced,
+        cached_at=record.cached_at,
+        initial_reply=initial_reply,
+        original_source=deserialize_inbox_context_source(record.original_source_json),
+    )
+
+
+def persist_prefetched_inbox_context_source(cached: PrefetchedInboxContextSource) -> None:
+    original_source = cached.original_source or cached.source
+    record = PersistentInboxPrefetchRecord(
+        source_id=cached.source.source_id,
+        original_source_json=serialize_inbox_context_source(original_source),
+        hydrated_source_json=serialize_inbox_context_source(cached.source),
+        enhanced=cached.enhanced,
+        initial_reply=cached.initial_reply,
+        cached_at=cached.cached_at,
+        summary_signature=build_inbox_context_prefetch_summary_signature() if cached.initial_reply else "",
+    )
+    get_inbox_context_prefetch_persistent_cache().save(record)
+
+
+def delete_persistent_prefetched_inbox_context_source(source_id: int) -> None:
+    get_inbox_context_prefetch_persistent_cache().delete(source_id)
+
+
+def purge_stale_persistent_inbox_context_prefetch_cache(now: float | None = None) -> None:
+    get_inbox_context_prefetch_persistent_cache().purge_stale(now=now)
+
+
+def clear_persistent_inbox_context_prefetch_cache() -> None:
+    get_inbox_context_prefetch_persistent_cache().clear()
 
 
 def build_inbox_context_summary_messages(source: InboxContextSource) -> list[dict[str, str]]:
@@ -2755,9 +2911,10 @@ async def enhance_inbox_youtube_context_source(
 
 
 def purge_stale_inbox_context_prefetch_cache(now: float | None = None) -> None:
-    if not inbox_context_prefetch_cache:
-        return
     current_time = now if now is not None else time.time()
+    if not inbox_context_prefetch_cache:
+        purge_stale_persistent_inbox_context_prefetch_cache(current_time)
+        return
     expired_source_ids = [
         source_id
         for source_id, cached in inbox_context_prefetch_cache.items()
@@ -2765,12 +2922,31 @@ def purge_stale_inbox_context_prefetch_cache(now: float | None = None) -> None:
     ]
     for source_id in expired_source_ids:
         inbox_context_prefetch_cache.pop(source_id, None)
+    purge_stale_persistent_inbox_context_prefetch_cache(current_time)
 
 
 def pop_prefetched_inbox_context_source(source: InboxContextSource) -> PrefetchedInboxContextSource | None:
     purge_stale_inbox_context_prefetch_cache()
     cached = inbox_context_prefetch_cache.pop(source.source_id, None)
+    if cached is not None:
+        if not prefetched_inbox_context_source_matches(source, cached):
+            logger.info(
+                "Discarded in-memory prefetched source because Inbox source changed source_id=%s",
+                source.source_id,
+            )
+        else:
+            cached_source = replace(cached.source, remaining_ready_count=source.remaining_ready_count)
+            return replace(cached, source=cached_source)
+
+    cached = load_persistent_prefetched_inbox_context_source(source.source_id)
     if cached is None:
+        return None
+    if not prefetched_inbox_context_source_matches(source, cached):
+        delete_persistent_prefetched_inbox_context_source(source.source_id)
+        logger.info(
+            "Discarded persistent prefetched source because Inbox source changed source_id=%s",
+            source.source_id,
+        )
         return None
     cached_source = replace(cached.source, remaining_ready_count=source.remaining_ready_count)
     return replace(cached, source=cached_source)
@@ -2798,12 +2974,14 @@ async def _prefetch_inbox_context_source(source: InboxContextSource, *, reason: 
                     exc,
                 )
 
-        inbox_context_prefetch_cache[source_id] = PrefetchedInboxContextSource(
-            source=hydrated_source,
+        cached_source = build_prefetched_inbox_context_source(
+            source,
+            hydrated_source,
             enhanced=enhanced,
-            cached_at=time.time(),
             initial_reply=initial_reply,
         )
+        inbox_context_prefetch_cache[source_id] = cached_source
+        await asyncio.to_thread(persist_prefetched_inbox_context_source, cached_source)
         logger.info(
             "Inbox context prefetched source_id=%s kind=%s url=%s chars=%s original_chars=%s enhanced=%s summary=%s reason=%s",
             source_id,
@@ -3888,6 +4066,7 @@ async def handle_inbox_context_with_typing(update: Update, user_id: int):
             f"source #{source.source_id}: {exc}"
         )
         return
+    await asyncio.to_thread(delete_persistent_prefetched_inbox_context_source, source.source_id)
 
     logger.info(
         "Inbox context applied source_id=%s kind=%s url=%s chars=%s original_chars=%s enhanced=%s remaining=%s",

@@ -14,34 +14,33 @@ from extractors import WebExtractionResult
 from prompt_profiles import load_prompt_profile, normalize_model_name, render_prompt_profile
 
 
+def reset_bot_runtime_state() -> None:
+    bot.conversations.clear()
+    bot.session_histories.clear()
+    bot.source_memories.clear()
+    bot.active_source_sessions.clear()
+    bot.inbox_context_prefetch_cache.clear()
+    bot.inbox_context_prefetch_inflight.clear()
+    bot.inbox_context_prefetch_tasks.clear()
+    bot.inbox_context_prefetch_task = None
+    bot.inbox_context_ready_list_api_available = None
+    bot.session_identifiers.clear()
+    bot.last_activity_at_by_session.clear()
+    bot.youtube_audio_transcription_semaphore = None
+    bot.clear_persistent_inbox_context_prefetch_cache()
+
+
 @pytest.fixture(autouse=True)
-def clear_histories(monkeypatch):
+def clear_histories(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH", False)
-    bot.conversations.clear()
-    bot.session_histories.clear()
-    bot.source_memories.clear()
-    bot.active_source_sessions.clear()
-    bot.inbox_context_prefetch_cache.clear()
-    bot.inbox_context_prefetch_inflight.clear()
-    bot.inbox_context_prefetch_tasks.clear()
-    bot.inbox_context_prefetch_task = None
-    bot.inbox_context_ready_list_api_available = None
-    bot.session_identifiers.clear()
-    bot.last_activity_at_by_session.clear()
-    bot.youtube_audio_transcription_semaphore = None
+    monkeypatch.setattr(
+        bot,
+        "INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH",
+        tmp_path / "inbox-context-prefetch.sqlite3",
+    )
+    reset_bot_runtime_state()
     yield
-    bot.conversations.clear()
-    bot.session_histories.clear()
-    bot.source_memories.clear()
-    bot.active_source_sessions.clear()
-    bot.inbox_context_prefetch_cache.clear()
-    bot.inbox_context_prefetch_inflight.clear()
-    bot.inbox_context_prefetch_tasks.clear()
-    bot.inbox_context_prefetch_task = None
-    bot.inbox_context_ready_list_api_available = None
-    bot.session_identifiers.clear()
-    bot.last_activity_at_by_session.clear()
-    bot.youtube_audio_transcription_semaphore = None
+    reset_bot_runtime_state()
 
 
 class DummyFile:
@@ -1127,6 +1126,7 @@ def test_handle_inbox_context_uses_prefetched_source_and_summary(monkeypatch):
         enhanced=True,
         cached_at=bot.time.time(),
         initial_reply="미리 만든 요약",
+        original_source=source,
     )
 
     async def fake_stream_context_reply(*args, **kwargs):
@@ -1160,6 +1160,139 @@ def test_handle_inbox_context_uses_prefetched_source_and_summary(monkeypatch):
         bot.build_inbox_context_status_reply(prefetched_source, enhanced=True),
         "미리 만든 요약",
     ]
+
+
+def test_handle_inbox_context_uses_persistent_prefetched_source_and_summary(monkeypatch):
+    consumed = []
+    stream_calls = []
+    source = bot.InboxContextSource(
+        source_id=16,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n짧은 inbox 본문",
+        remaining_ready_count=0,
+    )
+    prefetched_source = bot.InboxContextSource(
+        source_id=16,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n긴 오디오 전사 본문",
+        remaining_ready_count=0,
+    )
+    bot.persist_prefetched_inbox_context_source(
+        bot.PrefetchedInboxContextSource(
+            source=prefetched_source,
+            enhanced=True,
+            cached_at=bot.time.time(),
+            initial_reply="디스크 캐시 요약",
+            original_source=source,
+        )
+    )
+
+    async def fake_stream_context_reply(*args, **kwargs):
+        stream_calls.append((args, kwargs))
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
+    monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
+    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
+    monkeypatch.setattr(
+        bot,
+        "enhance_inbox_youtube_context_source",
+        lambda *_args, **_kwargs: pytest.fail("persistent prefetched source should skip hydration"),
+    )
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=36),
+        message=DummyMessage(text="/ctx"),
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.handle_inbox_context(update, context))
+
+    key = session_key(36)
+    assert consumed == [16]
+    assert stream_calls == []
+    assert bot.source_memories[key][-1].content == "[YouTube Transcript]\n긴 오디오 전사 본문"
+    assert bot.session_histories[key][-1] == {"role": "assistant", "content": "디스크 캐시 요약"}
+    assert update.message.replies == [
+        bot.build_inbox_context_processing_reply(source),
+        bot.build_inbox_context_status_reply(prefetched_source, enhanced=True),
+        "디스크 캐시 요약",
+    ]
+    assert bot.load_persistent_prefetched_inbox_context_source(16) is None
+
+
+def test_handle_inbox_context_revalidates_persistent_prefetched_source(monkeypatch):
+    consumed = []
+    enhanced_calls = []
+    source = bot.InboxContextSource(
+        source_id=17,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n현재 inbox 본문",
+        remaining_ready_count=0,
+    )
+    stale_source = bot.InboxContextSource(
+        source_id=17,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n오래된 inbox 본문",
+        remaining_ready_count=0,
+    )
+    hydrated_source = bot.InboxContextSource(
+        source_id=17,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n실시간 재보강 본문",
+        remaining_ready_count=0,
+    )
+    bot.persist_prefetched_inbox_context_source(
+        bot.PrefetchedInboxContextSource(
+            source=stale_source,
+            enhanced=True,
+            cached_at=bot.time.time(),
+            initial_reply="stale summary",
+            original_source=stale_source,
+        )
+    )
+
+    async def fake_enhance(*_args, **_kwargs):
+        enhanced_calls.append(True)
+        return hydrated_source, True
+
+    async def fake_stream_context_reply(update, user_id, prompt, search_context, **kwargs):
+        await update.message.reply_text("실시간 요약")
+
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
+    monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
+    monkeypatch.setattr(bot, "enhance_inbox_youtube_context_source", fake_enhance)
+    monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=37),
+        message=DummyMessage(text="/ctx"),
+    )
+    context = SimpleNamespace(args=[])
+
+    asyncio.run(bot.handle_inbox_context(update, context))
+
+    key = session_key(37)
+    assert consumed == [17]
+    assert enhanced_calls == [True]
+    assert bot.source_memories[key][-1].content == "[YouTube Transcript]\n실시간 재보강 본문"
+    assert update.message.replies == [
+        bot.build_inbox_context_processing_reply(source),
+        bot.build_inbox_context_status_reply(hydrated_source, enhanced=True),
+        "실시간 요약",
+    ]
+    assert bot.load_persistent_prefetched_inbox_context_source(17) is None
 
 
 def test_handle_inbox_context_reports_empty_queue(monkeypatch):
