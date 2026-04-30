@@ -3424,16 +3424,16 @@ async def stream_context_reply(
     source: str = "context",
     source_kind: str | None = None,
     source_url: str | None = None,
+    status_message=None,
 ):
-    await stream_reply(
-        update,
-        user_id,
-        build_context_prompt(user_message),
-        search_context,
-        source=source,
-        source_kind=source_kind,
-        source_url=source_url,
-    )
+    kwargs = {
+        "source": source,
+        "source_kind": source_kind,
+        "source_url": source_url,
+    }
+    if status_message is not None:
+        kwargs["status_message"] = status_message
+    await stream_reply(update, user_id, build_context_prompt(user_message), search_context, **kwargs)
 
 
 # ──────────────────────────────────────────────
@@ -3447,6 +3447,7 @@ async def stream_reply(
     source: str = "chat",
     source_kind: str | None = None,
     source_url: str | None = None,
+    status_message=None,
 ):
     cleanup_inactive_sessions()
     session_key = build_session_key(user_id, update.message)
@@ -3477,7 +3478,7 @@ async def stream_reply(
     request_payload = build_chat_completion_payload(messages, effective_search_context)
     reasoning_disabled = bool(request_payload.get("chat_template_kwargs", {}).get("enable_thinking") is False)
 
-    bot_msg = None
+    bot_msg = status_message
     reasoning_status_msg = None
     full_text = ""
     display_text = ""
@@ -3538,14 +3539,14 @@ async def stream_reply(
                     and not reasoning_status_shown
                     and should_show_reasoning_status(reasoning_preview)
                 ):
-                    status_target = bot_msg if stream_to_telegram else reasoning_status_msg
+                    status_target = bot_msg if stream_to_telegram or bot_msg is not None else reasoning_status_msg
                     status_target, use_message_draft, shown, used_draft = await show_reasoning_status(
                         update,
                         draft_id,
                         use_message_draft if stream_to_telegram else False,
                         status_target,
                     )
-                    if stream_to_telegram:
+                    if stream_to_telegram or bot_msg is not None:
                         bot_msg = status_target
                     else:
                         reasoning_status_msg = status_target
@@ -3578,14 +3579,14 @@ async def stream_reply(
                     and not reasoning_status_shown
                     and should_show_reasoning_status(reasoning_preview)
                 ):
-                    status_target = bot_msg if stream_to_telegram else reasoning_status_msg
+                    status_target = bot_msg if stream_to_telegram or bot_msg is not None else reasoning_status_msg
                     status_target, use_message_draft, shown, used_draft = await show_reasoning_status(
                         update,
                         draft_id,
                         use_message_draft if stream_to_telegram else False,
                         status_target,
                     )
-                    if stream_to_telegram:
+                    if stream_to_telegram or bot_msg is not None:
                         bot_msg = status_target
                     else:
                         reasoning_status_msg = status_target
@@ -3900,7 +3901,7 @@ async def handle_message_with_typing(
     if user_text.rstrip().endswith("/s"):
         query = user_text.rstrip()[:-2].strip()
         if query:
-            await update.message.reply_text("🔍 검색 중...")
+            status_message = await update.message.reply_text("🔍 검색 중...")
             stage_started_at = asyncio.get_running_loop().time()
             search_results = await asyncio.to_thread(search_web, query)
             log_stage_metrics(
@@ -3912,7 +3913,7 @@ async def handle_message_with_typing(
                 detail=query,
                 chars=len(search_results) if search_results else 0,
             )
-            await stream_reply(update, user_id, query, search_results, source="search_suffix")
+            await stream_reply(update, user_id, query, search_results, source="search_suffix", status_message=status_message)
             return
 
     stage_started_at = asyncio.get_running_loop().time()
@@ -3930,7 +3931,7 @@ async def handle_message_with_typing(
         detail=auto_search_decision.query or auto_search_decision.reason,
     )
     if auto_search_decision.needs_search:
-        await update.message.reply_text("🔍 최신 정보 확인 중...")
+        status_message = await update.message.reply_text("🔍 최신 정보 확인 중...")
         search_started_at = asyncio.get_running_loop().time()
         search_results = await asyncio.to_thread(search_web, auto_search_decision.query or user_text)
         log_stage_metrics(
@@ -3942,7 +3943,7 @@ async def handle_message_with_typing(
             detail=auto_search_decision.query or user_text,
             chars=len(search_results) if search_results else 0,
         )
-        await stream_reply(update, user_id, user_text, search_results, source="auto_search")
+        await stream_reply(update, user_id, user_text, search_results, source="auto_search", status_message=status_message)
         return
 
     await stream_reply(update, user_id, user_text, source="chat")
@@ -3964,7 +3965,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("사용법: /s 검색할 내용")
         return
 
-    await update.message.reply_text("🔍 검색 중...")
+    status_message = await update.message.reply_text("🔍 검색 중...")
     stage_started_at = asyncio.get_running_loop().time()
     search_results = await asyncio.to_thread(search_web, query)
     log_stage_metrics(
@@ -3976,7 +3977,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         detail=query,
         chars=len(search_results) if search_results else 0,
     )
-    await stream_reply(update, user_id, query, search_results, source="search_command")
+    await stream_reply(update, user_id, query, search_results, source="search_command", status_message=status_message)
 
 
 async def handle_inbox_context(update: Update, context: ContextTypes.DEFAULT_TYPE):

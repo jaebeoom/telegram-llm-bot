@@ -1806,8 +1806,9 @@ def test_handle_message_auto_searches_when_classifier_requests_it(monkeypatch):
         source="context",
         source_kind=None,
         source_url=None,
+        status_message=None,
     ):
-        calls.append((user_id, user_message, search_context, source, source_kind, source_url))
+        calls.append((user_id, user_message, search_context, source, source_kind, source_url, status_message))
 
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
     monkeypatch.setattr(
@@ -1831,6 +1832,7 @@ def test_handle_message_auto_searches_when_classifier_requests_it(monkeypatch):
     asyncio.run(bot.handle_message(update, None))
 
     assert update.message.replies == ["🔍 최신 정보 확인 중..."]
+    status_message = update.message.reply_messages[0]
     assert calls == [
         (
             66,
@@ -1839,6 +1841,7 @@ def test_handle_message_auto_searches_when_classifier_requests_it(monkeypatch):
             "auto_search",
             None,
             None,
+            status_message,
         )
     ]
 
@@ -2639,6 +2642,32 @@ def test_stream_reply_final_delivery_sends_temporary_reasoning_status(monkeypatc
     assert message.reply_messages[1].deleted is False
     assert message.reply_messages[1].edits == []
     assert bot.conversations[session_key(779)][-1] == {"role": "assistant", "content": "323"}
+
+
+def test_stream_reply_final_delivery_reuses_status_message(monkeypatch):
+    bot.conversations.clear()
+
+    def fake_stream(messages, loop, queue):
+        loop.call_soon_threadsafe(queue.put_nowait, ("reasoning", "검색 결과를 검토한다"))
+        loop.call_soon_threadsafe(queue.put_nowait, ("token", "최종 답변"))
+        loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+    monkeypatch.setattr(bot, "_stream_llm_response", fake_stream)
+    use_delivery(monkeypatch, "final")
+
+    message = DummyMessage(text="질문")
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=780),
+        message=message,
+    )
+    status_message = asyncio.run(message.reply_text("🔍 검색 중..."))
+
+    asyncio.run(bot.stream_reply(update, 780, "질문", "[Web Search Results]\n검색 결과", source="auto_search", status_message=status_message))
+
+    assert message.replies == ["🔍 검색 중..."]
+    assert status_message.edits == ["🧠 추론 중...", "최종 답변"]
+    assert status_message.deleted is False
+    assert bot.conversations[session_key(780)][-1] == {"role": "assistant", "content": "최종 답변"}
 
 
 def test_stream_reply_skips_reasoning_status_for_trivial_reasoning(monkeypatch):
