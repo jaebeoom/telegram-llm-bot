@@ -134,6 +134,30 @@ def use_delivery(monkeypatch, mode: str):
     monkeypatch.setattr(bot, "TELEGRAM_RESPONSE_DELIVERY", mode)
 
 
+def test_bot_menu_commands_only_expose_core_full_names():
+    assert [(command.command, command.description) for command in bot.BOT_MENU_COMMANDS] == [
+        ("context", "Inbox 컨텍스트 가져오기"),
+        ("clear", "대화 기록 초기화"),
+        ("model", "현재 모델 확인"),
+    ]
+
+
+def test_setup_bot_commands_registers_menu_commands():
+    class DummyCommandBot:
+        def __init__(self):
+            self.commands = None
+
+        async def set_my_commands(self, commands):
+            self.commands = commands
+
+    command_bot = DummyCommandBot()
+    app = SimpleNamespace(bot=command_bot)
+
+    asyncio.run(bot.setup_bot_commands(app))
+
+    assert command_bot.commands == bot.BOT_MENU_COMMANDS
+
+
 def test_build_context_prompt_uses_default_for_blank_text():
     assert bot.build_context_prompt("   ") == "이 내용을 한국어로 간단히 요약해줘."
 

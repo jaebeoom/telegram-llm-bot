@@ -19,7 +19,7 @@ from urllib.parse import urlencode, urlparse, urlunparse
 import requests
 from dotenv import load_dotenv
 from tavily import TavilyClient
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
@@ -3816,11 +3816,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 LLM 봇 준비 완료!\n\n"
         "💬 일반 메시지 → LLM 대화\n"
-        "🔍 /s 질문 → 웹 검색 + LLM 답변\n"
-        "📥 /ctx → Inbox 컨텍스트 큐에서 오래된 소스 적용\n"
-        "📎 /e URL → LLM 없이 원문 추출\n"
-        "🗑️ /c → 대화 기록 초기화 + Vault 저장\n"
-        "ℹ️ /m → 현재 모델 확인\n\n"
+        "📥 /context → Inbox 컨텍스트 큐에서 오래된 소스 적용\n"
+        "🗑️ /clear → 대화 기록 초기화 + Vault 저장\n"
+        "ℹ️ /model → 현재 모델 확인\n\n"
+        "숨은 단축키: /s 검색, /ctx, /raw URL, /c, /m\n\n"
         f"📂 Vault: {vault_status}\n"
         f"🔐 접근 제어: {access_status}"
     )
@@ -4218,6 +4217,17 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📦 현재 모델: {model_name}\n🔧 설정 소스: {env_hint}")
 
 
+BOT_MENU_COMMANDS = [
+    BotCommand("context", "Inbox 컨텍스트 가져오기"),
+    BotCommand("clear", "대화 기록 초기화"),
+    BotCommand("model", "현재 모델 확인"),
+]
+
+
+async def setup_bot_commands(app: Application) -> None:
+    await app.bot.set_my_commands(BOT_MENU_COMMANDS)
+
+
 # ──────────────────────────────────────────────
 # 메인
 # ──────────────────────────────────────────────
@@ -4226,17 +4236,20 @@ def main():
     if missing_config:
         raise RuntimeError(f"Missing required configuration: {', '.join(missing_config)}")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(setup_bot_commands).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("s", handle_search))
     app.add_handler(CommandHandler("search", handle_search))
     app.add_handler(CommandHandler("ctx", handle_inbox_context))
+    app.add_handler(CommandHandler("context", handle_inbox_context))
     app.add_handler(CommandHandler("e", handle_extract))
     app.add_handler(CommandHandler("extract", handle_extract))
     app.add_handler(CommandHandler("raw", handle_extract))
     app.add_handler(CommandHandler("c", clear_history))
+    app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(CommandHandler("m", show_model))
+    app.add_handler(CommandHandler("model", show_model))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
