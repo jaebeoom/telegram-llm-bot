@@ -2376,6 +2376,20 @@ def test_build_chat_completion_payload_disables_thinking_for_light_context(monke
     assert payload["include_reasoning"] is False
 
 
+def test_build_chat_completion_payload_disables_thinking_for_default_context_prompt(monkeypatch):
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
+
+    payload = bot.build_chat_completion_payload(
+        [{"role": "user", "content": bot.DEFAULT_CONTEXT_PROMPT}],
+        search_context="[YouTube Transcript]\n본문",
+        user_message=bot.DEFAULT_CONTEXT_PROMPT,
+    )
+
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["reasoning"] == {"effort": "none", "exclude": True, "enabled": False}
+    assert payload["include_reasoning"] is False
+
+
 def test_build_chat_completion_payload_allows_thinking_for_deep_context(monkeypatch):
     monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
 

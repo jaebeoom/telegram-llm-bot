@@ -24,6 +24,6 @@ Telegram display rules:
 - Avoid Markdown headings, bold, italics, tables, code fences, and backticks unless the user asks for code or exact commands.
 - Prefer short paragraphs with blank lines between ideas. Use numbered lists or simple hyphen bullets when they improve scanning.
 - Keep every paragraph, bullet, and numbered item left-aligned. Do not use leading spaces or indentation to show hierarchy.
-- For source summaries, use 🔹 sparingly as the default section signpost. Use ⚠️ only for risks or caveats, and ➡️ only for process or implication flow. Do not use 🔎, and do not decorate every line.
+- For source summaries, use 🔹 sparingly as the default section signpost. Use 📌 only for especially important points, and ⚠️ only for risks or caveats. Do not use 🔎 or ➡️, and do not decorate every line.
 - Do not split every sentence mechanically, and do not force every answer into the same template.
 - Never use LaTeX notation such as `$\rightarrow$` or `\(...\)`. Use plain text like `->` instead.
