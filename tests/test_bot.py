@@ -2197,16 +2197,30 @@ def test_parse_enable_thinking_for_context_honors_legacy_disable(monkeypatch):
     assert bot.parse_enable_thinking_for_context() is False
 
 
-def test_build_chat_completion_payload_disables_thinking_for_context_when_configured(monkeypatch):
+def test_build_chat_completion_payload_disables_thinking_for_light_context(monkeypatch):
     monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
 
     payload = bot.build_chat_completion_payload(
         [{"role": "user", "content": "요약"}],
         search_context="[Web Article]\n본문",
+        user_message="요약해줘",
     )
 
     assert payload["stream_options"] == {"include_usage": True}
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_build_chat_completion_payload_allows_thinking_for_deep_context(monkeypatch):
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
+
+    payload = bot.build_chat_completion_payload(
+        [{"role": "user", "content": "비판적으로 분석해줘"}],
+        search_context="[Web Article]\n본문",
+        user_message="비판적으로 분석해줘",
+    )
+
+    assert payload["stream_options"] == {"include_usage": True}
+    assert "chat_template_kwargs" not in payload
 
 
 def test_build_chat_completion_payload_keeps_thinking_for_context_when_configured(monkeypatch):
@@ -2215,6 +2229,7 @@ def test_build_chat_completion_payload_keeps_thinking_for_context_when_configure
     payload = bot.build_chat_completion_payload(
         [{"role": "user", "content": "요약"}],
         search_context="[Web Article]\n본문",
+        user_message="요약해줘",
     )
 
     assert payload["stream_options"] == {"include_usage": True}

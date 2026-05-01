@@ -555,6 +555,13 @@ SOURCE_FOLLOWUP_SKIP_RE = re.compile(
     r"ignore\s+(the\s+)?(previous|context|source)|new\s+topic)",
     re.IGNORECASE,
 )
+CONTEXT_THINKING_TRIGGER_RE = re.compile(
+    r"(깊(?:게|이)|자세히|비판|검토|분석|비교|평가|판단|추론|논증|쟁점|리스크|위험|전략|"
+    r"의사결정|왜|어째서|원인|가능성|타당|반박|찬반|장단점|함의|시사점|"
+    r"deep|detail|critical|critique|analy[sz]e|compare|evaluate|judge|reason|infer|"
+    r"argument|risk|strategy|decision|why|cause|trade[- ]?off|pros?\s+and\s+cons?)",
+    re.IGNORECASE,
+)
 EXPLICIT_RECENCY_SIGNAL_RE = re.compile(
     r"("
     r"오늘|어제|지금|현재|최신|최근|이번\s*(주|달|분기|해)|올해|내일|방금|"
@@ -3401,14 +3408,24 @@ def build_context_prompt(user_message: str) -> str:
     return stripped or DEFAULT_CONTEXT_PROMPT
 
 
-def build_chat_completion_payload(messages: list[dict], search_context: str = "") -> dict:
+def should_allow_thinking_for_context(user_message: str) -> bool:
+    if ENABLE_THINKING_FOR_CONTEXT:
+        return True
+    return bool(CONTEXT_THINKING_TRIGGER_RE.search(user_message))
+
+
+def build_chat_completion_payload(
+    messages: list[dict],
+    search_context: str = "",
+    user_message: str = "",
+) -> dict:
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if search_context and not ENABLE_THINKING_FOR_CONTEXT:
+    if search_context and not should_allow_thinking_for_context(user_message):
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     return payload
 
@@ -3531,7 +3548,11 @@ async def stream_reply(
         source_url=effective_source_url,
         store_context_in_history=store_context_in_history,
     )
-    request_payload = build_chat_completion_payload(messages, effective_search_context)
+    request_payload = build_chat_completion_payload(
+        messages,
+        effective_search_context,
+        user_message=user_message,
+    )
     reasoning_disabled = bool(request_payload.get("chat_template_kwargs", {}).get("enable_thinking") is False)
 
     bot_msg = status_message

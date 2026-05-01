@@ -107,7 +107,7 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 | `ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY` | 기본값 `true`. 미리 hydration한 컨텍스트의 `/ctx` 기본 요약 응답도 background에서 생성 |
 | `ENABLE_INBOX_CONTEXT_PREFETCH_STARTUP_SUMMARY` | 기본값 `false`. 봇 시작 직후 prefetch에서도 요약 응답까지 미리 만들지 여부. 기본값은 재시작 직후 LLM 부하를 줄이기 위해 hydration만 수행 |
 | `INBOX_CONTEXT_PREFETCH_SUMMARY_TIMEOUT_SECONDS` | 기본값 `180`. prefetch 요약 LLM 호출 제한 시간 |
-| `ENABLE_THINKING_FOR_CONTEXT` | 기본값 `false`. URL/PDF/웹검색/Inbox 컨텍스트를 주입한 답변은 기본적으로 reasoning을 끄고, 깊은 분석이 필요할 때만 `true`로 켬 |
+| `ENABLE_THINKING_FOR_CONTEXT` | 기본값 `false`. URL/PDF/웹검색/Inbox 컨텍스트를 주입한 답변은 기본적으로 reasoning을 끄되, 분석/검토/비교/판단처럼 깊은 요청이면 서버 기본 reasoning을 허용함. 항상 허용하려면 `true` |
 | `ENABLE_TELEGRAM_DRAFT_STREAMING` | 하위 호환 변수. `TELEGRAM_RESPONSE_DELIVERY`가 없을 때만 읽으며, `true`는 `draft`, `false`는 `edit`로 해석 |
 | `DISABLE_THINKING_FOR_CONTEXT` | 하위 호환 변수. `ENABLE_THINKING_FOR_CONTEXT`가 없을 때만 읽음 |
 | `ENABLE_RESPONSE_VALIDATION` | 기본값 `true`. 최종 LLM 답변에 중국어/일본어 문자가 포함되면 전송 직전에 한국어 번역 pass를 수행 |
@@ -136,7 +136,7 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 샘플링 관련 값(`temperature`, `max_tokens`, `top_p` 등)은 봇이 별도로 덮어쓰지 않고 OMLX 같은 서버 쪽 설정을 그대로 따릅니다.
 `TELEGRAM_RESPONSE_DELIVERY=final`은 최종 답변을 새 메시지로 보내며, reasoning token이 감지되면 임시 `🧠 추론 중...` 메시지를 보냈다가 최종 답변 전송 후 삭제합니다. 내부 LLM 응답은 계속 스트리밍으로 읽어 timeout, usage, reasoning 메트릭을 유지합니다.
 모바일에서 네이티브 draft 스트리밍을 다시 쓰고 싶다면 `TELEGRAM_RESPONSE_DELIVERY=draft`, 단일 메시지 편집 스트리밍을 쓰고 싶다면 `TELEGRAM_RESPONSE_DELIVERY=edit`로 바꿀 수 있습니다.
-컨텍스트 주입 답변에서 깊은 분석을 우선하고 싶다면 `ENABLE_THINKING_FOR_CONTEXT=true`로 바꿀 수 있습니다.
+컨텍스트 주입 답변은 기본적으로 빠른 비추론 모드로 처리하되, 사용자가 분석/검토/비교/판단처럼 깊은 작업을 요청하면 서버 기본 reasoning을 허용합니다. 모든 컨텍스트 답변에서 reasoning을 우선하고 싶다면 `ENABLE_THINKING_FOR_CONTEXT=true`로 바꿀 수 있습니다.
 자동 검색은 명시적인 최신성 신호가 있으면 바로 검색하고, 그 외 일반 메시지는 로컬 LLM에 짧은 분류 요청을 보내 `needs_search=true`일 때만 검색합니다. `TAVILY_API_KEY`가 없으면 자동 검색도 비활성화됩니다.
 Playwright fallback을 쓰려면 Python 패키지 설치 외에 `uv run playwright install chromium`도 한 번 실행해야 합니다.
 YouTube 오디오 전사 fallback을 쓰려면 시스템에 `ffmpeg`와 `ffprobe`가 있어야 합니다. macOS에서는 `brew install ffmpeg`로 함께 설치됩니다.
