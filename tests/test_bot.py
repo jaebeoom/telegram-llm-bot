@@ -1574,6 +1574,12 @@ def test_normalize_response_text_converts_common_latex_arrows():
     assert bot.normalize_response_text(r"상태 변화는 $A \rightarrow B$ 입니다.") == "상태 변화는 A → B 입니다."
 
 
+def test_normalize_response_text_strips_markdown_syntax_for_plain_telegram_display():
+    source = "**결론**\n\n- `Q4`가 낫습니다.\n\n## 이유\n짧게 봐야 합니다."
+
+    assert bot.normalize_response_text(source) == "결론\n\n- Q4가 낫습니다.\n\n이유\n짧게 봐야 합니다."
+
+
 def test_normalize_response_text_converts_markdown_table_to_comparison_list():
     source = """| 구분 | 블록 (Block) | 소파이 (SoFi) |
 | :--- | :--- | :--- |
