@@ -1249,6 +1249,63 @@ def test_handle_inbox_context_uses_persistent_prefetched_source_and_summary(monk
     assert bot.load_persistent_prefetched_inbox_context_source(16) is None
 
 
+def test_startup_prefetch_skips_initial_summary(monkeypatch):
+    source = bot.InboxContextSource(
+        source_id=18,
+        source_kind="web",
+        source_url="https://example.com/article",
+        title="Article",
+        text="[Web Article]\n본문",
+        remaining_ready_count=0,
+    )
+
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH", True)
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY", True)
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH_STARTUP_SUMMARY", False)
+    monkeypatch.setattr(bot, "fetch_prefetchable_inbox_context_sources", lambda limit: [source])
+    monkeypatch.setattr(bot, "generate_inbox_context_initial_reply", lambda *_args: pytest.fail("startup should skip summary"))
+
+    asyncio.run(bot.prefetch_inbox_context_sources(reason="startup", target=1))
+
+    cached = bot.inbox_context_prefetch_cache[18]
+    assert cached.source == source
+    assert cached.initial_reply is None
+
+
+def test_scheduled_prefetch_keeps_initial_summary(monkeypatch):
+    source = bot.InboxContextSource(
+        source_id=19,
+        source_kind="web",
+        source_url="https://example.com/article",
+        title="Article",
+        text="[Web Article]\n본문",
+        remaining_ready_count=0,
+    )
+
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH", True)
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY", True)
+    monkeypatch.setattr(bot, "fetch_prefetchable_inbox_context_sources", lambda limit: [source])
+    monkeypatch.setattr(bot, "generate_inbox_context_initial_reply", lambda *_args: "예약 요약")
+
+    asyncio.run(bot.prefetch_inbox_context_sources(reason="scheduled", target=1))
+
+    cached = bot.inbox_context_prefetch_cache[19]
+    assert cached.initial_reply == "예약 요약"
+
+
+def test_startup_prefetch_uses_startup_target(monkeypatch):
+    requested_limits = []
+
+    async def fake_prefetch(*, reason="scheduled", target=None):
+        requested_limits.append((reason, target))
+
+    monkeypatch.setattr(bot, "prefetch_inbox_context_sources", fake_prefetch)
+
+    asyncio.run(bot.run_inbox_context_prefetch_startup_job(SimpleNamespace()))
+
+    assert requested_limits == [("startup", bot.INBOX_CONTEXT_PREFETCH_STARTUP_TARGET)]
+
+
 def test_handle_inbox_context_revalidates_persistent_prefetched_source(monkeypatch):
     consumed = []
     enhanced_calls = []
@@ -1481,6 +1538,34 @@ def test_handle_inbox_context_enhances_youtube_with_audio_fallback(monkeypatch):
         )
     ]
     assert bot.source_memories[session_key(34)][-1].content == "[YouTube Transcript]\n긴 오디오 전사 본문"
+
+
+def test_enhance_inbox_youtube_uses_audio_transcript_cache_before_public_transcript(monkeypatch):
+    source = bot.InboxContextSource(
+        source_id=20,
+        source_kind="youtube",
+        source_url="https://www.youtube.com/watch?v=abcdefghijk",
+        title="Video",
+        text="[YouTube Transcript]\n짧은 inbox 본문",
+        remaining_ready_count=0,
+    )
+
+    monkeypatch.setattr(
+        bot,
+        "load_cached_youtube_audio_transcript",
+        lambda video_id: "[YouTube Transcript]\n캐시된 오디오 전사" if video_id == "abcdefghijk" else None,
+    )
+    monkeypatch.setattr(
+        bot,
+        "extract_youtube_transcript_result",
+        lambda *_args: pytest.fail("public transcript should be skipped when audio transcript cache exists"),
+    )
+
+    enhanced_source, enhanced = asyncio.run(bot.enhance_inbox_youtube_context_source(None, 0, source))
+
+    assert enhanced is True
+    assert enhanced_source.text == "[YouTube Transcript]\n캐시된 오디오 전사"
+    assert enhanced_source.source_url == "https://www.youtube.com/watch?v=abcdefghijk"
 
 
 def test_handle_e_command_returns_web_text_without_llm(monkeypatch):
@@ -2098,11 +2183,11 @@ def test_parse_enable_thinking_for_context_prefers_positive_flag(monkeypatch):
     assert bot.parse_enable_thinking_for_context() is True
 
 
-def test_parse_enable_thinking_for_context_defaults_to_enabled(monkeypatch):
+def test_parse_enable_thinking_for_context_defaults_to_disabled(monkeypatch):
     monkeypatch.delenv("ENABLE_THINKING_FOR_CONTEXT", raising=False)
     monkeypatch.delenv("DISABLE_THINKING_FOR_CONTEXT", raising=False)
 
-    assert bot.parse_enable_thinking_for_context() is True
+    assert bot.parse_enable_thinking_for_context() is False
 
 
 def test_parse_enable_thinking_for_context_honors_legacy_disable(monkeypatch):

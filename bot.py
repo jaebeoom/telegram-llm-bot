@@ -35,6 +35,10 @@ from inbox_prefetch_cache import (
     InboxPrefetchPersistentCache,
     PersistentInboxPrefetchRecord,
 )
+from telegram_llm_bot.youtube_audio_transcription import (
+    load_config_from_env as load_youtube_audio_transcription_config,
+    transcript_cache_path,
+)
 from extractors import (
     TWEET_URL_PATTERN,
     YOUTUBE_URL_PATTERN,
@@ -268,12 +272,12 @@ def parse_telegram_response_delivery() -> str:
 
 def parse_enable_thinking_for_context() -> bool:
     if os.getenv("ENABLE_THINKING_FOR_CONTEXT") is not None:
-        return parse_bool_env("ENABLE_THINKING_FOR_CONTEXT", True)
+        return parse_bool_env("ENABLE_THINKING_FOR_CONTEXT", False)
 
     if os.getenv("DISABLE_THINKING_FOR_CONTEXT") is not None:
         return not parse_bool_env("DISABLE_THINKING_FOR_CONTEXT", False)
 
-    return True
+    return False
 
 
 TELEGRAM_RESPONSE_DELIVERY = parse_telegram_response_delivery()
@@ -403,7 +407,15 @@ INBOX_CONTEXT_PREFETCH_INTERVAL_SECONDS = parse_positive_float_env(
 )
 INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS = parse_positive_float_env(
     "INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS",
-    6 * 60 * 60,
+    72 * 60 * 60,
+)
+INBOX_CONTEXT_PREFETCH_STARTUP_TARGET = parse_positive_int_env(
+    "INBOX_CONTEXT_PREFETCH_STARTUP_TARGET",
+    2,
+)
+ENABLE_INBOX_CONTEXT_PREFETCH_STARTUP_SUMMARY = parse_bool_env(
+    "ENABLE_INBOX_CONTEXT_PREFETCH_STARTUP_SUMMARY",
+    False,
 )
 INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH = parse_optional_path_env(
     "INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH",
@@ -430,13 +442,15 @@ if ENV_FILES_LOADED:
 else:
     logger.warning("No env files were loaded.")
 logger.info(
-    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s youtube_audio_transcription=%s inbox_context_prefetch=%s target=%s prefetch_summary=%s persistent_prefetch_cache=%s",
+    "Runtime options telegram_response_delivery=%s enable_thinking_for_context=%s youtube_audio_transcription=%s inbox_context_prefetch=%s target=%s startup_target=%s prefetch_summary=%s startup_summary=%s persistent_prefetch_cache=%s",
     TELEGRAM_RESPONSE_DELIVERY,
     ENABLE_THINKING_FOR_CONTEXT,
     ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION,
     ENABLE_INBOX_CONTEXT_PREFETCH,
     INBOX_CONTEXT_PREFETCH_TARGET,
+    INBOX_CONTEXT_PREFETCH_STARTUP_TARGET,
     ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY,
+    ENABLE_INBOX_CONTEXT_PREFETCH_STARTUP_SUMMARY,
     bool(INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH),
 )
 
@@ -1296,6 +1310,21 @@ def build_inbox_context_prefetch_summary_signature() -> str:
     return hashlib.sha256(
         json.dumps(signature_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def load_cached_youtube_audio_transcript(video_id: str) -> str | None:
+    config = load_youtube_audio_transcription_config()
+    path = transcript_cache_path(config, video_id)
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        logger.warning("YouTube transcript cache read failed video_id=%s path=%s: %s", video_id, path, exc)
+        return None
+    if not text:
+        return None
+    return f"[YouTube Transcript]\n{text}"
 
 
 def build_prefetched_inbox_context_source(
@@ -2818,6 +2847,17 @@ async def enhance_inbox_youtube_context_source(
     video_id = match.group(1)
     canonical_url = normalize_source_url(source.source_url, "youtube") or source.source_url
 
+    cached_audio_context = await asyncio.to_thread(load_cached_youtube_audio_transcript, video_id)
+    if cached_audio_context:
+        logger.info(
+            "Inbox YouTube context enhanced from transcript cache source_id=%s video_id=%s original_chars=%s enhanced_chars=%s",
+            source.source_id,
+            video_id,
+            len(source.text),
+            len(cached_audio_context),
+        )
+        return replace(source, text=cached_audio_context, source_url=canonical_url), True
+
     stage_started_at = asyncio.get_running_loop().time()
     yt_result = await asyncio.to_thread(extract_youtube_transcript_result, video_id)
     yt_context = yt_result.content
@@ -2952,6 +2992,14 @@ def pop_prefetched_inbox_context_source(source: InboxContextSource) -> Prefetche
     return replace(cached, source=cached_source)
 
 
+def should_generate_inbox_context_prefetch_summary(reason: str) -> bool:
+    if not ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY:
+        return False
+    if reason == "startup" and not ENABLE_INBOX_CONTEXT_PREFETCH_STARTUP_SUMMARY:
+        return False
+    return True
+
+
 async def _prefetch_inbox_context_source(source: InboxContextSource, *, reason: str) -> None:
     source_id = source.source_id
     if source_id in inbox_context_prefetch_cache:
@@ -2962,7 +3010,7 @@ async def _prefetch_inbox_context_source(source: InboxContextSource, *, reason: 
     try:
         hydrated_source, enhanced = await enhance_inbox_youtube_context_source(None, 0, source)
         initial_reply: str | None = None
-        if ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY:
+        if should_generate_inbox_context_prefetch_summary(reason):
             try:
                 initial_reply = await asyncio.to_thread(generate_inbox_context_initial_reply, hydrated_source)
             except Exception as exc:
@@ -3025,19 +3073,20 @@ def ensure_inbox_context_source_prefetch_task(
     return task
 
 
-async def prefetch_inbox_context_sources(*, reason: str = "scheduled") -> None:
+async def prefetch_inbox_context_sources(*, reason: str = "scheduled", target: int | None = None) -> None:
     if not ENABLE_INBOX_CONTEXT_PREFETCH or INBOX_CONTEXT_PREFETCH_TARGET <= 0:
         return
 
     purge_stale_inbox_context_prefetch_cache()
-    capacity = INBOX_CONTEXT_PREFETCH_TARGET - len(inbox_context_prefetch_cache) - len(inbox_context_prefetch_tasks)
+    effective_target = max(1, target or INBOX_CONTEXT_PREFETCH_TARGET)
+    capacity = effective_target - len(inbox_context_prefetch_cache) - len(inbox_context_prefetch_tasks)
     if capacity <= 0:
         return
 
     try:
         sources = await asyncio.to_thread(
             fetch_prefetchable_inbox_context_sources,
-            INBOX_CONTEXT_PREFETCH_TARGET,
+            effective_target,
         )
     except Exception as exc:
         logger.warning("Inbox context prefetch source fetch failed reason=%s: %s", reason, exc)
@@ -3045,7 +3094,7 @@ async def prefetch_inbox_context_sources(*, reason: str = "scheduled") -> None:
 
     tasks: list[asyncio.Task] = []
     for source in sources:
-        if len(inbox_context_prefetch_cache) + len(inbox_context_prefetch_tasks) >= INBOX_CONTEXT_PREFETCH_TARGET:
+        if len(inbox_context_prefetch_cache) + len(inbox_context_prefetch_tasks) >= effective_target:
             break
         if source.source_id in inbox_context_prefetch_cache:
             continue
@@ -3075,6 +3124,13 @@ def start_inbox_context_prefetch(reason: str = "manual") -> None:
 
 async def run_inbox_context_prefetch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await prefetch_inbox_context_sources(reason="scheduled")
+
+
+async def run_inbox_context_prefetch_startup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await prefetch_inbox_context_sources(
+        reason="startup",
+        target=INBOX_CONTEXT_PREFETCH_STARTUP_TARGET,
+    )
 
 
 def append_prefetched_inbox_context_reply_to_history(
@@ -4254,7 +4310,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if ENABLE_INBOX_CONTEXT_PREFETCH and app.job_queue is not None:
-        app.job_queue.run_once(run_inbox_context_prefetch_job, when=5, name="inbox-context-prefetch-startup")
+        app.job_queue.run_once(run_inbox_context_prefetch_startup_job, when=5, name="inbox-context-prefetch-startup")
         app.job_queue.run_repeating(
             run_inbox_context_prefetch_job,
             interval=INBOX_CONTEXT_PREFETCH_INTERVAL_SECONDS,
