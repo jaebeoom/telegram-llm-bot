@@ -236,7 +236,10 @@ TYPING_ACTION_INTERVAL = 2.5
 TYPING_ACTION_RETRY_INTERVAL = 1.0
 TYPING_ACTION_SEND_TIMEOUT = 3.0
 TELEGRAM_TEXT_LIMIT = 4000
-DEFAULT_CONTEXT_PROMPT = "이 내용을 한국어로 간단히 요약해줘."
+DEFAULT_CONTEXT_PROMPT = (
+    "이 자료를 한국어로 요약해줘. 너무 짧게 압축하지 말고, "
+    "무엇에 관한 자료인지 먼저 밝힌 뒤 핵심 주장과 중요한 근거를 짧은 단락이나 불릿으로 정리해줘."
+)
 RESPONSE_VALIDATION_FAILURE_TEXT = "⚠️ 응답이 한국어 출력 규칙을 통과하지 못했습니다. 다시 요청해 주세요."
 DRAFT_STREAM_FINAL_FLUSH_DELAY = 0.30
 MIN_REASONING_STATUS_CHARS = 2
@@ -713,6 +716,12 @@ def apply_llm_request_options(payload: dict, *, allow_reasoning: bool = True) ->
     return payload
 
 
+def disable_llm_reasoning(payload: dict) -> dict:
+    payload["chat_template_kwargs"] = {"enable_thinking": False}
+    payload["reasoning"] = {"enabled": False}
+    return payload
+
+
 def should_force_auto_search(user_message: str) -> bool:
     """Hard guardrail for clearly time-sensitive prompts.
 
@@ -804,8 +813,8 @@ def classify_recency_need(user_message: str, session_key: SessionKey | None = No
         "stream": False,
         "temperature": 0,
         "max_tokens": 220,
-        "chat_template_kwargs": {"enable_thinking": False},
     }
+    disable_llm_reasoning(payload)
 
     response = requests.post(
         build_chat_completions_url(),
@@ -1491,8 +1500,8 @@ def summarize_inbox_context_source(source: InboxContextSource) -> str:
         "stream": False,
         "temperature": 0.2,
         "max_tokens": 500,
-        "chat_template_kwargs": {"enable_thinking": False},
     }
+    disable_llm_reasoning(payload)
     response = requests.post(
         build_chat_completions_url(),
         headers=build_llm_headers(),
@@ -1530,7 +1539,7 @@ def generate_inbox_context_initial_reply(source: InboxContextSource) -> str:
         "stream": False,
     }
     if source.text and not ENABLE_THINKING_FOR_CONTEXT:
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        disable_llm_reasoning(payload)
     else:
         apply_llm_request_options(payload)
 
@@ -3464,7 +3473,7 @@ def build_chat_completion_payload(
         "stream_options": {"include_usage": True},
     }
     if search_context and not should_allow_thinking_for_context(user_message):
-        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        disable_llm_reasoning(payload)
     else:
         apply_llm_request_options(payload)
     return payload

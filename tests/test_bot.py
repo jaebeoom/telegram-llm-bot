@@ -159,7 +159,7 @@ def test_setup_bot_commands_registers_menu_commands():
 
 
 def test_build_context_prompt_uses_default_for_blank_text():
-    assert bot.build_context_prompt("   ") == "이 내용을 한국어로 간단히 요약해줘."
+    assert bot.build_context_prompt("   ") == bot.DEFAULT_CONTEXT_PROMPT
 
 
 def test_build_context_prompt_keeps_user_text():
@@ -1773,30 +1773,30 @@ def test_normalize_model_name_slugifies_consistently():
 def test_load_prompt_profile_includes_base_and_matching_model_rules():
     profile = load_prompt_profile("Gemma 4 26B A4B 6 bit MLX")
 
-    assert "Answer in Korean." in profile
+    assert "Answer in Korean unless the user explicitly asks for another language." in profile
     assert "Do not agree by default. Test the premise first." in profile
 
 
 def test_build_system_prompt_includes_runtime_date_and_profile_rules():
     prompt = bot.build_system_prompt("Gemma 4 26B A4B 6 bit MLX", today=bot.datetime(2026, 4, 5))
 
-    assert "Today's date is 2026-04-05." in prompt
+    assert "Today is 2026-04-05." in prompt
     assert "Be a thoughtful collaborator, not a cheerleader." in prompt
 
 
 def test_load_prompt_profile_matches_qwen36_model_rules():
     profile = load_prompt_profile("spicyneuron/Qwen3.6-35B-A3B-MLX-5.4bit")
 
-    assert "Answer in Korean." in profile
+    assert "Answer in Korean unless the user explicitly asks for another language." in profile
     assert "Be a rigorous thought partner for investment research" in profile
-    assert "For current or date-sensitive facts, do not rely on internal memory alone." in profile
+    assert "Do not invent current facts." in profile
 
 
 def test_render_prompt_profile_replaces_template_variables():
     prompt = render_prompt_profile("Gemma 4 26B A4B 6 bit MLX", variables={"today": "2026-04-05"})
 
     assert "{today}" not in prompt
-    assert "Today's date is 2026-04-05." in prompt
+    assert "Today is 2026-04-05." in prompt
 
 
 def test_render_prompt_profile_keeps_literal_braces():
@@ -1804,7 +1804,7 @@ def test_render_prompt_profile_keeps_literal_braces():
     prompt = render_prompt_profile("test-model", variables={"today": "2026-04-05"}, prompts_dir=prompts_dir)
 
     assert 'Return JSON like {"ok": true}.' in prompt
-    assert "Today's date is 2026-04-05." in prompt
+    assert "2026-04-05" in prompt
 
 
 def test_validate_runtime_config_reports_missing_required_values(monkeypatch):
@@ -1854,6 +1854,13 @@ def test_apply_llm_request_options_can_skip_reasoning(monkeypatch):
     assert payload["zdr"] is True
 
 
+def test_disable_llm_reasoning_sets_template_and_openrouter_flags():
+    payload = bot.disable_llm_reasoning({"model": "deepseek/deepseek-v4-pro"})
+
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["reasoning"] == {"enabled": False}
+
+
 def test_build_chat_completion_payload_applies_reasoning_when_thinking_allowed(monkeypatch):
     monkeypatch.setattr(bot, "MODEL_NAME", "deepseek/deepseek-v4-pro")
     monkeypatch.setattr(bot, "LLM_REASONING_EFFORT", "xhigh")
@@ -1881,7 +1888,7 @@ def test_build_chat_completion_payload_keeps_context_thinking_disabled_without_r
     payload = bot.build_chat_completion_payload([{"role": "user", "content": "요약"}], search_context="ctx")
 
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert "reasoning" not in payload
+    assert payload["reasoning"] == {"enabled": False}
 
 
 def test_validate_runtime_config_reports_invalid_session_inactive_ttl(monkeypatch):
@@ -1972,6 +1979,7 @@ def test_classify_recency_need_parses_json_response(monkeypatch):
     assert calls[0][2]["stream"] is False
     assert calls[0][2]["temperature"] == 0
     assert calls[0][2]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert calls[0][2]["reasoning"] == {"enabled": False}
 
 
 def test_handle_message_auto_searches_when_classifier_requests_it(monkeypatch):
@@ -2272,6 +2280,7 @@ def test_build_chat_completion_payload_disables_thinking_for_light_context(monke
 
     assert payload["stream_options"] == {"include_usage": True}
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["reasoning"] == {"enabled": False}
 
 
 def test_build_chat_completion_payload_allows_thinking_for_deep_context(monkeypatch):
