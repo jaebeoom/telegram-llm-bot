@@ -238,7 +238,9 @@ TYPING_ACTION_SEND_TIMEOUT = 3.0
 TELEGRAM_TEXT_LIMIT = 4000
 DEFAULT_CONTEXT_PROMPT = (
     "이 자료를 한국어로 요약해줘. 너무 짧게 압축하지 말고, "
-    "무엇에 관한 자료인지 먼저 밝힌 뒤 핵심 주장과 중요한 근거를 짧은 단락이나 불릿으로 정리해줘."
+    "무엇에 관한 자료인지 먼저 밝힌 뒤 핵심 주장과 중요한 근거를 짧은 단락이나 불릿으로 정리해줘. "
+    "텔레그램에서 읽기 좋게 섹션 앞에는 📌 🔎 ⚠️ 같은 안내용 이모지를 적당히 쓰되, "
+    "장식처럼 남발하지 말고 모든 문단과 불릿은 들여쓰기 없이 왼쪽 정렬해줘."
 )
 RESPONSE_VALIDATION_FAILURE_TEXT = "⚠️ 응답이 한국어 출력 규칙을 통과하지 못했습니다. 다시 요청해 주세요."
 DRAFT_STREAM_FINAL_FLUSH_DELAY = 0.30
@@ -718,7 +720,8 @@ def apply_llm_request_options(payload: dict, *, allow_reasoning: bool = True) ->
 
 def disable_llm_reasoning(payload: dict) -> dict:
     payload["chat_template_kwargs"] = {"enable_thinking": False}
-    payload["reasoning"] = {"enabled": False}
+    payload["reasoning"] = {"effort": "none", "exclude": True, "enabled": False}
+    payload["include_reasoning"] = False
     return payload
 
 
@@ -2209,15 +2212,36 @@ def normalize_inline_latex(text: str) -> str:
 def normalize_response_text(text: str) -> str:
     if not text:
         return text
-    return normalize_markdown_tables(
-        normalize_inline_latex(
-            sanitize_replacement_chars(
-                strip_markdown(
-                    strip_think(text)
+    return normalize_plain_text_spacing(
+        normalize_markdown_tables(
+            normalize_inline_latex(
+                sanitize_replacement_chars(
+                    strip_markdown(
+                        strip_think(text)
+                    )
                 )
             )
         )
     ).strip()
+
+
+def normalize_plain_text_spacing(text: str) -> str:
+    """Keep model output readable in Telegram plain-text bubbles."""
+    if not text:
+        return text
+
+    normalized_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            normalized_lines.append("")
+            continue
+
+        stripped = re.sub(r"^([0-9]+[.)])\s+", r"\1 ", stripped)
+        stripped = re.sub(r"^[*•]\s+", "- ", stripped)
+        normalized_lines.append(stripped)
+
+    return "\n".join(normalized_lines)
 
 
 def response_validation_issue(text: str) -> str | None:
@@ -3212,12 +3236,98 @@ async def send_message_draft(update: Update, draft_id: int, text: str) -> bool:
         return False
 
     bot = message.get_bot()
-    return await bot.send_message_draft(
-        chat_id=message.chat_id,
-        draft_id=draft_id,
-        text=text[:TELEGRAM_TEXT_LIMIT],
-        message_thread_id=message.message_thread_id,
+    kwargs = {
+        "chat_id": message.chat_id,
+        "draft_id": draft_id,
+        "text": text[:TELEGRAM_TEXT_LIMIT],
+    }
+    if message.message_thread_id is not None:
+        kwargs["message_thread_id"] = message.message_thread_id
+    return await bot.send_message_draft(**kwargs)
+
+
+async def send_raw_message_draft(update: Update, draft_id: int, text: str, *, include_thread: bool) -> bool:
+    message = update.message
+    if not message or not text:
+        return False
+
+    payload = {
+        "chat_id": message.chat_id,
+        "draft_id": draft_id,
+        "text": text[:TELEGRAM_TEXT_LIMIT],
+    }
+    if include_thread and message.message_thread_id is not None:
+        payload["message_thread_id"] = message.message_thread_id
+    return bool(await message.get_bot().do_api_request("sendMessageDraft", api_kwargs=payload))
+
+
+async def diagnose_draft(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_allowed(user_id):
+        await update.message.reply_text("⛔ 접근 권한이 없습니다.")
+        return
+    if not update.message:
+        return
+
+    message = update.message
+    checks: list[tuple[str, bool, str]] = []
+    base_id = build_draft_id()
+
+    async def run_check(label: str, call):
+        try:
+            ok = await call()
+            checks.append((label, bool(ok), "ok" if ok else "false"))
+        except Exception as e:
+            checks.append((label, False, f"{type(e).__name__}: {e}"))
+
+    await run_check(
+        "ptb:auto-thread",
+        lambda: send_message_draft(update, base_id, "draft test 1/4: PTB auto thread"),
     )
+    await run_check(
+        "ptb:no-thread",
+        lambda: message.get_bot().send_message_draft(
+            chat_id=message.chat_id,
+            draft_id=base_id + 1,
+            text="draft test 2/4: PTB no thread",
+        ),
+    )
+    await run_check(
+        "raw:auto-thread",
+        lambda: send_raw_message_draft(
+            update,
+            base_id + 2,
+            "draft test 3/4: raw auto thread",
+            include_thread=True,
+        ),
+    )
+    await run_check(
+        "raw:no-thread",
+        lambda: send_raw_message_draft(
+            update,
+            base_id + 3,
+            "draft test 4/4: raw no thread",
+            include_thread=False,
+        ),
+    )
+
+    logger.info(
+        "Draft diagnostic user=%s chat=%s thread=%s results=%s",
+        user_id,
+        message.chat_id,
+        message.message_thread_id,
+        checks,
+    )
+    lines = [
+        "Draft 진단 완료",
+        f"chat_id: {message.chat_id}",
+        f"thread_id: {message.message_thread_id or 'none'}",
+        "",
+    ]
+    lines.extend(f"- {label}: {'성공' if ok else '실패'} ({detail})" for label, ok, detail in checks)
+    lines.append("")
+    lines.append("Telegram 클라이언트에 draft 4개가 보이는지도 같이 확인해줘.")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def show_reasoning_status(
@@ -3616,6 +3726,7 @@ async def stream_reply(
     stream_to_telegram = TELEGRAM_RESPONSE_DELIVERY in {"draft", "edit"}
     use_message_draft = TELEGRAM_RESPONSE_DELIVERY == "draft"
     draft_visible = False
+    draft_stream_disabled = False
     draft_id = build_draft_id()
     loop = asyncio.get_running_loop()
     stream_started_at = loop.time()
@@ -3647,6 +3758,8 @@ async def stream_reply(
                 continue
 
             if event == "reasoning":
+                if reasoning_disabled:
+                    continue
                 token = payload
                 if not token:
                     continue
@@ -3737,6 +3850,8 @@ async def stream_reply(
                 continue
             if not stream_to_telegram:
                 continue
+            if draft_stream_disabled:
+                continue
 
             # draft 또는 edit 기반 표시를 일정 간격으로 갱신한다.
             now = loop.time()
@@ -3770,9 +3885,10 @@ async def stream_reply(
                     except TelegramError as e:
                         if draft_visible:
                             logger.warning(
-                                "sendMessageDraft failed after draft became visible; skipping this draft update to avoid mixed-mode duplicates: %s",
+                                "sendMessageDraft failed after draft became visible; disabling draft updates for this response to avoid mixed-mode duplicates: %s",
                                 e,
                             )
+                            draft_stream_disabled = True
                             last_edit_time = now
                             continue
                         logger.warning("sendMessageDraft failed, falling back to edit_text: %s", e)
@@ -3811,7 +3927,7 @@ async def stream_reply(
             final_chunks = chunk_text(final_text)
             if use_message_draft:
                 final_draft_text = final_chunks[0][:TELEGRAM_TEXT_LIMIT]
-                if final_draft_text and final_draft_text != last_streamed_text:
+                if final_draft_text and final_draft_text != last_streamed_text and not draft_stream_disabled:
                     try:
                         await send_message_draft(update, draft_id, final_draft_text)
                         draft_visible = True
@@ -3827,6 +3943,7 @@ async def stream_reply(
                                 "final sendMessageDraft flush failed after draft became visible; sending final message without switching modes: %s",
                                 e,
                             )
+                            draft_stream_disabled = True
                         else:
                             logger.warning("final sendMessageDraft flush failed, falling back to final message only: %s", e)
                             use_message_draft = False
@@ -3866,7 +3983,7 @@ async def stream_reply(
             "Stream metrics user=%s source=%s mode=%s reasoning_disabled=%s reasoning_used=%s reasoning_chars=%s reasoning_tokens=%s first_token_ms=%s first_reasoning_ms=%s first_content_ms=%s first_visible_ms=%s total_ms=%s updates=%s chars=%s",
             user_id,
             source,
-            "draft" if use_message_draft else ("edit" if stream_to_telegram else "final"),
+            "draft-disabled" if draft_stream_disabled else ("draft" if use_message_draft else ("edit" if stream_to_telegram else "final")),
             reasoning_disabled,
             reasoning_used,
             reasoning_chars,
@@ -4376,6 +4493,7 @@ def main():
     app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(CommandHandler("m", show_model))
     app.add_handler(CommandHandler("model", show_model))
+    app.add_handler(CommandHandler("drafttest", diagnose_draft))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

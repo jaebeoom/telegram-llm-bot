@@ -60,6 +60,7 @@ class DummyBot:
         self.fail_draft = fail_draft
         self.fail_draft_calls = set(fail_draft_calls or [])
         self.drafts = []
+        self.raw_drafts = []
         self.chat_actions = []
         self._draft_call_count = 0
 
@@ -68,6 +69,12 @@ class DummyBot:
         if self.fail_draft or self._draft_call_count in self.fail_draft_calls:
             raise bot.TelegramError("draft unsupported")
         self.drafts.append(kwargs)
+        return True
+
+    async def do_api_request(self, endpoint, api_kwargs=None, return_type=None, **kwargs):
+        if endpoint == "sendMessageDraft":
+            self.raw_drafts.append(api_kwargs or {})
+            return True
         return True
 
     async def send_chat_action(self, **kwargs):
@@ -1692,6 +1699,22 @@ def test_normalize_response_text_strips_markdown_syntax_for_plain_telegram_displ
     assert bot.normalize_response_text(source) == "결론\n\n- Q4가 낫습니다.\n\n이유\n짧게 봐야 합니다."
 
 
+def test_normalize_response_text_removes_indentation_for_telegram_display():
+    source = (
+        "핵심 주장\n"
+        "    로봇 공학의 데이터 문제가 핵심이다.\n"
+        "  * 시뮬레이션 데이터는 규모가 크다.\n"
+        "    1.   실제 로봇 데이터는 품질이 높다."
+    )
+
+    assert bot.normalize_response_text(source) == (
+        "핵심 주장\n"
+        "로봇 공학의 데이터 문제가 핵심이다.\n"
+        "- 시뮬레이션 데이터는 규모가 크다.\n"
+        "1. 실제 로봇 데이터는 품질이 높다."
+    )
+
+
 def test_normalize_response_text_converts_markdown_table_to_comparison_list():
     source = """| 구분 | 블록 (Block) | 소파이 (SoFi) |
 | :--- | :--- | :--- |
@@ -1858,7 +1881,8 @@ def test_disable_llm_reasoning_sets_template_and_openrouter_flags():
     payload = bot.disable_llm_reasoning({"model": "deepseek/deepseek-v4-pro"})
 
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert payload["reasoning"] == {"enabled": False}
+    assert payload["reasoning"] == {"effort": "none", "exclude": True, "enabled": False}
+    assert payload["include_reasoning"] is False
 
 
 def test_build_chat_completion_payload_applies_reasoning_when_thinking_allowed(monkeypatch):
@@ -1888,7 +1912,8 @@ def test_build_chat_completion_payload_keeps_context_thinking_disabled_without_r
     payload = bot.build_chat_completion_payload([{"role": "user", "content": "요약"}], search_context="ctx")
 
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert payload["reasoning"] == {"enabled": False}
+    assert payload["reasoning"] == {"effort": "none", "exclude": True, "enabled": False}
+    assert payload["include_reasoning"] is False
 
 
 def test_validate_runtime_config_reports_invalid_session_inactive_ttl(monkeypatch):
@@ -1979,7 +2004,8 @@ def test_classify_recency_need_parses_json_response(monkeypatch):
     assert calls[0][2]["stream"] is False
     assert calls[0][2]["temperature"] == 0
     assert calls[0][2]["chat_template_kwargs"] == {"enable_thinking": False}
-    assert calls[0][2]["reasoning"] == {"enabled": False}
+    assert calls[0][2]["reasoning"] == {"effort": "none", "exclude": True, "enabled": False}
+    assert calls[0][2]["include_reasoning"] is False
 
 
 def test_handle_message_auto_searches_when_classifier_requests_it(monkeypatch):
@@ -2231,6 +2257,61 @@ def test_build_draft_id_is_positive_non_zero():
     assert bot.build_draft_id() > 0
 
 
+def test_send_message_draft_omits_empty_thread_id():
+    dummy_bot = DummyBot()
+    message = DummyMessage(text="질문", bot_instance=dummy_bot, message_thread_id=None)
+    update = SimpleNamespace(message=message)
+
+    asyncio.run(bot.send_message_draft(update, 123, "테스트"))
+
+    assert dummy_bot.drafts == [
+        {
+            "chat_id": 999,
+            "draft_id": 123,
+            "text": "테스트",
+        }
+    ]
+
+
+def test_send_message_draft_includes_present_thread_id():
+    dummy_bot = DummyBot()
+    message = DummyMessage(text="질문", bot_instance=dummy_bot, message_thread_id=456)
+    update = SimpleNamespace(message=message)
+
+    asyncio.run(bot.send_message_draft(update, 123, "테스트"))
+
+    assert dummy_bot.drafts == [
+        {
+            "chat_id": 999,
+            "draft_id": 123,
+            "text": "테스트",
+            "message_thread_id": 456,
+        }
+    ]
+
+
+def test_diagnose_draft_checks_ptb_and_raw_paths(monkeypatch):
+    monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "build_draft_id", lambda: 1000)
+    dummy_bot = DummyBot()
+    message = DummyMessage(text="/drafttest", bot_instance=dummy_bot, message_thread_id=456)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=321),
+        message=message,
+    )
+
+    asyncio.run(bot.diagnose_draft(update, SimpleNamespace()))
+
+    assert [draft["draft_id"] for draft in dummy_bot.drafts] == [1000, 1001]
+    assert dummy_bot.drafts[0]["message_thread_id"] == 456
+    assert "message_thread_id" not in dummy_bot.drafts[1]
+    assert [draft["draft_id"] for draft in dummy_bot.raw_drafts] == [1002, 1003]
+    assert dummy_bot.raw_drafts[0]["message_thread_id"] == 456
+    assert "message_thread_id" not in dummy_bot.raw_drafts[1]
+    assert message.replies
+    assert "Draft 진단 완료" in message.replies[0]
+
+
 def test_parse_telegram_response_delivery_defaults_to_final(monkeypatch):
     monkeypatch.delenv("TELEGRAM_RESPONSE_DELIVERY", raising=False)
     monkeypatch.delenv("ENABLE_TELEGRAM_DRAFT_STREAMING", raising=False)
@@ -2280,7 +2361,8 @@ def test_build_chat_completion_payload_disables_thinking_for_light_context(monke
 
     assert payload["stream_options"] == {"include_usage": True}
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert payload["reasoning"] == {"enabled": False}
+    assert payload["reasoning"] == {"effort": "none", "exclude": True, "enabled": False}
+    assert payload["include_reasoning"] is False
 
 
 def test_build_chat_completion_payload_allows_thinking_for_deep_context(monkeypatch):
@@ -2847,6 +2929,32 @@ def test_stream_reply_final_delivery_sends_temporary_reasoning_status(monkeypatc
     assert bot.conversations[session_key(779)][-1] == {"role": "assistant", "content": "323"}
 
 
+def test_stream_reply_suppresses_reasoning_status_when_payload_disables_reasoning(monkeypatch):
+    bot.conversations.clear()
+
+    def fake_stream(messages, loop, queue):
+        loop.call_soon_threadsafe(queue.put_nowait, ("reasoning", "검색 결과를 검토한다"))
+        loop.call_soon_threadsafe(queue.put_nowait, ("token", "요약 답변"))
+        loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+    monkeypatch.setattr(bot, "_stream_llm_response", fake_stream)
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
+    use_delivery(monkeypatch, "final")
+
+    dummy_bot = DummyBot()
+    message = DummyMessage(text="요약", bot_instance=dummy_bot)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=781),
+        message=message,
+    )
+
+    asyncio.run(bot.stream_reply(update, 781, "요약", "[Web Article]\n본문", source="web"))
+
+    assert message.replies == ["요약 답변"]
+    assert dummy_bot.drafts == []
+    assert bot.conversations[session_key(781)][-1] == {"role": "assistant", "content": "요약 답변"}
+
+
 def test_stream_reply_final_delivery_reuses_status_message(monkeypatch):
     bot.conversations.clear()
 
@@ -2865,7 +2973,7 @@ def test_stream_reply_final_delivery_reuses_status_message(monkeypatch):
     )
     status_message = asyncio.run(message.reply_text("🔍 검색 중..."))
 
-    asyncio.run(bot.stream_reply(update, 780, "질문", "[Web Search Results]\n검색 결과", source="auto_search", status_message=status_message))
+    asyncio.run(bot.stream_reply(update, 780, "분석해줘", "[Web Search Results]\n검색 결과", source="auto_search", status_message=status_message))
 
     assert message.replies == ["🔍 검색 중..."]
     assert status_message.edits == ["🧠 추론 중...", "최종 답변"]
@@ -2961,7 +3069,7 @@ def test_stream_reply_keeps_draft_mode_after_visible_draft_failure(monkeypatch):
 
     asyncio.run(bot.stream_reply(update, 655, "질문"))
 
-    assert [draft["text"] for draft in dummy_bot.drafts] == ["테", "테스트"]
+    assert [draft["text"] for draft in dummy_bot.drafts] == ["테"]
     assert message.replies == ["테스트"]
     assert message.reply_messages[0].edits == []
     assert bot.conversations[session_key(655)][-1] == {"role": "assistant", "content": "테스트"}
