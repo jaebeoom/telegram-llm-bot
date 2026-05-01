@@ -1092,6 +1092,7 @@ def test_handle_inbox_context_applies_source_and_consumes(monkeypatch):
         stream_calls.append((user_id, user_message, search_context, kwargs))
 
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY", True)
     monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
     monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
     monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
@@ -1157,6 +1158,7 @@ def test_handle_inbox_context_uses_prefetched_source_and_summary(monkeypatch):
         stream_calls.append((args, kwargs))
 
     monkeypatch.setattr(bot, "is_allowed", lambda user_id: True)
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY", True)
     monkeypatch.setattr(bot, "fetch_next_inbox_context_source", lambda: source)
     monkeypatch.setattr(bot, "mark_inbox_context_source_consumed", lambda source_id: consumed.append(source_id))
     monkeypatch.setattr(bot, "stream_context_reply", fake_stream_context_reply)
@@ -1189,6 +1191,7 @@ def test_handle_inbox_context_uses_prefetched_source_and_summary(monkeypatch):
 def test_handle_inbox_context_uses_persistent_prefetched_source_and_summary(monkeypatch):
     consumed = []
     stream_calls = []
+    monkeypatch.setattr(bot, "ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY", True)
     source = bot.InboxContextSource(
         source_id=16,
         source_kind="youtube",
@@ -1818,6 +1821,67 @@ def test_validate_runtime_config_accepts_present_required_values(monkeypatch):
     monkeypatch.setattr(bot, "SESSION_INACTIVE_TTL_CONFIG_ERROR", None)
 
     assert bot.validate_runtime_config() == []
+
+
+def test_apply_llm_request_options_adds_reasoning_and_provider_policy(monkeypatch):
+    monkeypatch.setattr(bot, "LLM_REASONING_EFFORT", "xhigh")
+    monkeypatch.setattr(bot, "LLM_PROVIDER_DATA_COLLECTION", "deny")
+    monkeypatch.setattr(bot, "LLM_REQUIRE_PARAMETERS", True)
+    monkeypatch.setattr(bot, "LLM_ZERO_DATA_RETENTION", False)
+    monkeypatch.setattr(bot, "LLM_ALLOW_FALLBACKS_RAW", "")
+
+    payload = bot.apply_llm_request_options({"model": "deepseek/deepseek-v4-pro"})
+
+    assert payload["reasoning"] == {"effort": "xhigh"}
+    assert payload["provider"] == {
+        "data_collection": "deny",
+        "require_parameters": True,
+    }
+    assert "zdr" not in payload
+
+
+def test_apply_llm_request_options_can_skip_reasoning(monkeypatch):
+    monkeypatch.setattr(bot, "LLM_REASONING_EFFORT", "xhigh")
+    monkeypatch.setattr(bot, "LLM_PROVIDER_DATA_COLLECTION", "")
+    monkeypatch.setattr(bot, "LLM_REQUIRE_PARAMETERS", False)
+    monkeypatch.setattr(bot, "LLM_ZERO_DATA_RETENTION", True)
+    monkeypatch.setattr(bot, "LLM_ALLOW_FALLBACKS_RAW", "false")
+
+    payload = bot.apply_llm_request_options({"model": "deepseek/deepseek-v4-pro"}, allow_reasoning=False)
+
+    assert "reasoning" not in payload
+    assert payload["provider"] == {"allow_fallbacks": False}
+    assert payload["zdr"] is True
+
+
+def test_build_chat_completion_payload_applies_reasoning_when_thinking_allowed(monkeypatch):
+    monkeypatch.setattr(bot, "MODEL_NAME", "deepseek/deepseek-v4-pro")
+    monkeypatch.setattr(bot, "LLM_REASONING_EFFORT", "xhigh")
+    monkeypatch.setattr(bot, "LLM_PROVIDER_DATA_COLLECTION", "deny")
+    monkeypatch.setattr(bot, "LLM_REQUIRE_PARAMETERS", True)
+    monkeypatch.setattr(bot, "LLM_ZERO_DATA_RETENTION", False)
+    monkeypatch.setattr(bot, "LLM_ALLOW_FALLBACKS_RAW", "")
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", True)
+
+    payload = bot.build_chat_completion_payload([{"role": "user", "content": "분석해줘"}], search_context="ctx")
+
+    assert payload["model"] == "deepseek/deepseek-v4-pro"
+    assert payload["reasoning"] == {"effort": "xhigh"}
+    assert payload["provider"] == {
+        "data_collection": "deny",
+        "require_parameters": True,
+    }
+    assert "chat_template_kwargs" not in payload
+
+
+def test_build_chat_completion_payload_keeps_context_thinking_disabled_without_reasoning(monkeypatch):
+    monkeypatch.setattr(bot, "LLM_REASONING_EFFORT", "xhigh")
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
+
+    payload = bot.build_chat_completion_payload([{"role": "user", "content": "요약"}], search_context="ctx")
+
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning" not in payload
 
 
 def test_validate_runtime_config_reports_invalid_session_inactive_ttl(monkeypatch):

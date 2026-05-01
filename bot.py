@@ -133,10 +133,19 @@ LLM_API_BASE_URL = (
     or os.getenv("LLM_API_BASE_URL")
     or os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
 )
-LLM_API_KEY = os.getenv("OMLX_API_KEY") or os.getenv("LLM_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+if "openrouter.ai" in LLM_API_BASE_URL.lower():
+    LLM_API_KEY = OPENROUTER_API_KEY or os.getenv("LLM_API_KEY", "") or os.getenv("OMLX_API_KEY", "")
+else:
+    LLM_API_KEY = os.getenv("OMLX_API_KEY") or os.getenv("LLM_API_KEY", "") or OPENROUTER_API_KEY
 LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER_NAME", "OMLX")
 ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "")
 MODEL_NAME = ((os.getenv("OMLX_MODEL") or os.getenv("MODEL_NAME")) or "").strip()
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "").strip()
+LLM_PROVIDER_DATA_COLLECTION = os.getenv("LLM_PROVIDER_DATA_COLLECTION", "").strip()
+LLM_REQUIRE_PARAMETERS = os.getenv("LLM_REQUIRE_PARAMETERS", "").strip().lower() in {"1", "true", "yes", "on"}
+LLM_ZERO_DATA_RETENTION = os.getenv("LLM_ZERO_DATA_RETENTION", "").strip().lower() in {"1", "true", "yes", "on"}
+LLM_ALLOW_FALLBACKS_RAW = os.getenv("LLM_ALLOW_FALLBACKS", "").strip().lower()
 VAULT_CAPTURE_PATH = (
     os.getenv("VAULT_CAPTURE_PATH") or os.getenv("VAULT_HAIKU_PATH") or ""
 ).strip()
@@ -399,7 +408,7 @@ INBOX_CONTEXT_PREVIEW_CHARS = parse_positive_int_env(
     700,
 )
 ENABLE_INBOX_CONTEXT_PREFETCH = parse_bool_env("ENABLE_INBOX_CONTEXT_PREFETCH", True)
-ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY = parse_bool_env("ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY", True)
+ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY = parse_bool_env("ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY", False)
 INBOX_CONTEXT_PREFETCH_TARGET = parse_positive_int_env("INBOX_CONTEXT_PREFETCH_TARGET", 5)
 INBOX_CONTEXT_PREFETCH_INTERVAL_SECONDS = parse_positive_float_env(
     "INBOX_CONTEXT_PREFETCH_INTERVAL_SECONDS",
@@ -675,6 +684,33 @@ def build_llm_headers() -> dict[str, str]:
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     return headers
+
+
+def build_llm_provider_options() -> dict:
+    provider: dict[str, object] = {}
+    if LLM_PROVIDER_DATA_COLLECTION:
+        provider["data_collection"] = LLM_PROVIDER_DATA_COLLECTION
+    if LLM_REQUIRE_PARAMETERS:
+        provider["require_parameters"] = True
+    if LLM_ALLOW_FALLBACKS_RAW in {"1", "true", "yes", "on"}:
+        provider["allow_fallbacks"] = True
+    elif LLM_ALLOW_FALLBACKS_RAW in {"0", "false", "no", "off"}:
+        provider["allow_fallbacks"] = False
+    return provider
+
+
+def apply_llm_request_options(payload: dict, *, allow_reasoning: bool = True) -> dict:
+    if allow_reasoning and LLM_REASONING_EFFORT:
+        payload["reasoning"] = {"effort": LLM_REASONING_EFFORT}
+
+    provider = build_llm_provider_options()
+    if provider:
+        payload["provider"] = provider
+
+    if LLM_ZERO_DATA_RETENTION:
+        payload["zdr"] = True
+
+    return payload
 
 
 def should_force_auto_search(user_message: str) -> bool:
@@ -1495,6 +1531,8 @@ def generate_inbox_context_initial_reply(source: InboxContextSource) -> str:
     }
     if source.text and not ENABLE_THINKING_FOR_CONTEXT:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        apply_llm_request_options(payload)
 
     response = requests.post(
         build_chat_completions_url(),
@@ -3427,6 +3465,8 @@ def build_chat_completion_payload(
     }
     if search_context and not should_allow_thinking_for_context(user_message):
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        apply_llm_request_options(payload)
     return payload
 
 

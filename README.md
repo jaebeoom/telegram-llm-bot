@@ -62,11 +62,17 @@ TAVILY_API_KEY=your_tavily_api_key
 ENABLE_AUTO_SEARCH=true
 TELEGRAM_RESPONSE_DELIVERY=final
 ENABLE_THINKING_FOR_CONTEXT=true
-LLM_API_BASE_URL=http://127.0.0.1:8001/v1
-LLM_API_KEY=omlx
-LLM_PROVIDER_NAME=OMLX
 ALLOWED_USER_IDS=your_telegram_user_id
-MODEL_NAME=your_loaded_local_model_name
+MODEL_NAME=deepseek/deepseek-v4-pro
+LLM_PROVIDER_NAME=OpenRouter
+LLM_REASONING_EFFORT=xhigh
+LLM_PROVIDER_DATA_COLLECTION=deny
+LLM_REQUIRE_PARAMETERS=true
+LLM_ZERO_DATA_RETENTION=false
+
+# 공용 shared env 예시: ../.shared-ai.env
+# LLM_API_BASE_URL=https://openrouter.ai/api/v1
+# OPENROUTER_API_KEY=your_openrouter_api_key
 VAULT_CAPTURE_PATH=~/path/to/your/Vault/Capture
 INBOX_API_BASE_URL=http://localhost:8000
 INBOX_API_ACCESS_TOKEN=your_inbox_access_token
@@ -87,10 +93,16 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 | `TELEGRAM_RESPONSE_DELIVERY` | 기본값 `final`. `final`은 최종 답변을 새 메시지로 전송, `draft`는 `sendMessageDraft`, `edit`은 단일 메시지 `edit_text` 스트리밍 사용 |
 | `LLM_API_BASE_URL` | OMLX 등 OpenAI-compatible LLM 서버의 base URL. OMLX 기본 포트는 `8000`, 현재 예시는 `http://127.0.0.1:8001/v1` |
 | `LLM_API_KEY` | LLM 서버 인증 키. OMLX에서 auth가 켜져 있으면 반드시 필요 |
+| `OPENROUTER_API_KEY` | OpenRouter API key. `LLM_API_BASE_URL`이 `openrouter.ai`이면 `LLM_API_KEY`보다 우선 |
 | `LLM_PROVIDER_NAME` | 봇 메시지에 표시할 LLM 제공자 이름, 기본값 `OMLX` |
 | `ALLOWED_USER_IDS` | 허용할 Telegram user id 목록, 쉼표 구분 |
 | `MODEL_NAME` | 사용할 로컬 모델 이름. `OMLX_MODEL`이 없으면 필수 |
 | `OMLX_BASE_URL` / `OMLX_MODEL` / `OMLX_API_KEY` | 각각 `LLM_API_BASE_URL` / `MODEL_NAME` / `LLM_API_KEY`보다 우선하는 OMLX 전용 별칭 |
+| `LLM_REASONING_EFFORT` | OpenRouter 등 reasoning 지원 서버에 넘길 reasoning effort. DeepSeek V4 Pro 상시 추론은 `xhigh` 권장 |
+| `LLM_PROVIDER_DATA_COLLECTION` | OpenRouter provider routing의 `data_collection` 값. 데이터 수집 provider를 피하려면 `deny` |
+| `LLM_REQUIRE_PARAMETERS` | 기본값 `false`. `true`면 요청 parameter를 지원하는 provider로만 라우팅 |
+| `LLM_ZERO_DATA_RETENTION` | 기본값 `false`. `true`면 ZDR endpoint만 사용. 해당 모델 endpoint가 없으면 실패할 수 있음 |
+| `LLM_ALLOW_FALLBACKS` | 비워두면 OpenRouter 기본값 사용. `false`면 fallback provider를 막음 |
 | `VAULT_CAPTURE_PATH` | 세션 로그를 Markdown으로 저장할 Vault 경로, 선택 사항. 기존 `VAULT_HAIKU_PATH`도 하위 호환 별칭으로 읽음 |
 | `INBOX_API_BASE_URL` | 기본값 `http://localhost:8000`. `/ctx`가 context source를 가져올 `telegram-inbox-bot` API base URL |
 | `INBOX_API_ACCESS_TOKEN` | Inbox bot의 `ACCESS_TOKEN`이 설정되어 있을 때 같은 값을 넣음. 비어 있으면 Authorization 헤더 없이 호출 |
@@ -104,7 +116,7 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 | `INBOX_CONTEXT_PREFETCH_CACHE_TTL_SECONDS` | 기본값 `259200`(72시간). 미리 처리한 컨텍스트 캐시 유지 시간 |
 | `INBOX_CONTEXT_PREFETCH_STARTUP_TARGET` | 기본값 `2`. 봇 시작 직후 한 번에 미리 준비할 Inbox 컨텍스트 수 |
 | `INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH` | 기본값 `.cache/inbox-context-prefetch.sqlite3`. prefetch artifact를 재시작 뒤에도 재사용할 SQLite 캐시 경로. 빈 값이면 비활성화 |
-| `ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY` | 기본값 `true`. 미리 hydration한 컨텍스트의 `/ctx` 기본 요약 응답도 background에서 생성 |
+| `ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY` | 기본값 `false`. 미리 hydration한 컨텍스트의 `/ctx` 기본 요약 응답도 background에서 생성. 비용을 줄이려면 꺼둠 |
 | `ENABLE_INBOX_CONTEXT_PREFETCH_STARTUP_SUMMARY` | 기본값 `false`. 봇 시작 직후 prefetch에서도 요약 응답까지 미리 만들지 여부. 기본값은 재시작 직후 LLM 부하를 줄이기 위해 hydration만 수행 |
 | `INBOX_CONTEXT_PREFETCH_SUMMARY_TIMEOUT_SECONDS` | 기본값 `180`. prefetch 요약 LLM 호출 제한 시간 |
 | `ENABLE_THINKING_FOR_CONTEXT` | 기본값 `false`. URL/PDF/웹검색/Inbox 컨텍스트를 주입한 답변은 기본적으로 reasoning을 끄되, 분석/검토/비교/판단처럼 깊은 요청이면 서버 기본 reasoning을 허용함. 항상 허용하려면 `true` |
@@ -241,7 +253,7 @@ YouTube 오디오 전사는 `mlx-community/whisper-large-v3-turbo` 모델을 별
 
 Inbox YouTube source는 LLM bot에서 같은 URL을 다시 추출해 공개 자막 결과로 갱신합니다. 공개 자막 요청이 YouTube의 `request_blocked` 등으로 실패하고 오디오 전사 fallback이 켜져 있으면, 직접 URL 주입과 같은 자동 전사 경로로 먼저 읽어둔 본문 대신 전사 전문을 적용합니다. 전사도 실패하면 실패 사유를 보낸 뒤 먼저 읽어둔 본문을 사용합니다.
 
-`ENABLE_INBOX_CONTEXT_PREFETCH=true`이면 bot이 주기적으로 Inbox ready 큐를 확인해 다음 컨텍스트를 미리 hydration하고, `ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY=true`이면 `/ctx` 기본 요약 응답도 background에서 생성합니다. 캐시가 있는 소스는 `/ctx` 시점에 전사와 첫 요약 LLM 호출을 건너뜁니다. `INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH`가 비어 있지 않으면 prefetch artifact를 SQLite에도 저장해 bot 재시작 뒤에도 재사용합니다. 다만 `/ctx`는 항상 먼저 Inbox의 현재 `/next` 결과를 조회하고, 그 `source_id`와 원본 본문이 맞는 캐시만 재사용합니다. 현재 `telegram-inbox-bot` API가 `/api/context-sources/next`만 제공하는 경우 FIFO를 깨지 않기 위해 가장 오래된 1개만 안전하게 미리 처리합니다. Inbox 쪽에서 ready list/peek API가 제공되면 `INBOX_CONTEXT_PREFETCH_TARGET` 값만큼 선처리합니다.
+`ENABLE_INBOX_CONTEXT_PREFETCH=true`이면 bot이 주기적으로 Inbox ready 큐를 확인해 다음 컨텍스트를 미리 hydration하고, `ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY=true`이면 `/ctx` 기본 요약 응답도 background에서 생성합니다. 기본값은 비용을 줄이기 위해 summary 생성을 끄고 hydration만 미리 합니다. 캐시가 있는 소스는 `/ctx` 시점에 전사를 건너뛸 수 있고, summary 옵션을 켠 경우 첫 요약 LLM 호출도 건너뜁니다. `INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH`가 비어 있지 않으면 prefetch artifact를 SQLite에도 저장해 bot 재시작 뒤에도 재사용합니다. 다만 `/ctx`는 항상 먼저 Inbox의 현재 `/next` 결과를 조회하고, 그 `source_id`와 원본 본문이 맞는 캐시만 재사용합니다. 현재 `telegram-inbox-bot` API가 `/api/context-sources/next`만 제공하는 경우 FIFO를 깨지 않기 위해 가장 오래된 1개만 안전하게 미리 처리합니다. Inbox 쪽에서 ready list/peek API가 제공되면 `INBOX_CONTEXT_PREFETCH_TARGET` 값만큼 선처리합니다.
 
 첫 구현은 임베딩 없이 큐 방식으로 동작합니다. 가져온 소스는 `/c`로 세션을 종료하기 전까지 현재 LLM 세션의 활성 컨텍스트로 남습니다. 활성 컨텍스트가 있을 때도 일반 후속 질문은 자동 검색 분류를 거치며, 검색이 필요한 경우 검색 결과와 source memory에서 고른 관련 chunk를 함께 사용합니다. 명시적으로 검색하려면 `/s`를 사용할 수 있습니다.
 
