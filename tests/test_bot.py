@@ -1715,6 +1715,15 @@ def test_normalize_response_text_removes_indentation_for_telegram_display():
     )
 
 
+def test_normalize_response_text_strips_internal_context_marker():
+    source = (
+        "결론적으로 Emerald의 해자는 규제와 생태계 결합에 있다."
+        "\n\n[이전 AI 답변 일부 생략. 같은 내용을 반복하지 말고 최신 질문에 필요한 부분만 참고.]"
+    )
+
+    assert bot.normalize_response_text(source) == "결론적으로 Emerald의 해자는 규제와 생태계 결합에 있다."
+
+
 def test_normalize_response_text_converts_markdown_table_to_comparison_list():
     source = """| 구분 | 블록 (Block) | 소파이 (SoFi) |
 | :--- | :--- | :--- |
@@ -2249,8 +2258,10 @@ def test_prepare_messages_compacts_assistant_history_in_llm_payload(monkeypatch)
     assert assistant_messages[1]["content"].startswith("최근 답변")
     assert len(assistant_messages[0]["content"]) < len(old_answer)
     assert len(assistant_messages[1]["content"]) < len(recent_answer)
-    assert "이전 AI 답변 일부 생략" in assistant_messages[0]["content"]
-    assert "이전 AI 답변 일부 생략" in assistant_messages[1]["content"]
+    assert assistant_messages[0]["content"].endswith("\n...")
+    assert assistant_messages[1]["content"].endswith("\n...")
+    assert "이전 AI 답변 일부 생략" not in assistant_messages[0]["content"]
+    assert "이전 AI 답변 일부 생략" not in assistant_messages[1]["content"]
 
 
 def test_build_draft_id_is_positive_non_zero():

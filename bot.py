@@ -201,6 +201,7 @@ MAX_RECENT_ASSISTANT_CONTEXT_CHARS = 1200
 ASSISTANT_CONTEXT_TRUNCATION_NOTICE = (
     "\n\n[이전 AI 답변 일부 생략. 같은 내용을 반복하지 말고 최신 질문에 필요한 부분만 참고.]"
 )
+ASSISTANT_CONTEXT_TRUNCATION_MARKER = "..."
 YOUTUBE_AUDIO_TRANSCRIPTION_MODEL = "mlx-community/whisper-large-v3-turbo"
 YOUTUBE_AUDIO_WORKER_STREAM_LIMIT = 8 * 1024 * 1024
 YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES = {
@@ -239,7 +240,8 @@ TELEGRAM_TEXT_LIMIT = 4000
 DEFAULT_CONTEXT_PROMPT = (
     "이 자료를 한국어로 요약해줘. 너무 짧게 압축하지 말고, "
     "무엇에 관한 자료인지 먼저 밝힌 뒤 핵심 주장과 중요한 근거를 짧은 단락이나 불릿으로 정리해줘. "
-    "텔레그램에서 읽기 좋게 섹션 앞에는 📌 🔎 ⚠️ 같은 안내용 이모지를 적당히 쓰되, "
+    "텔레그램에서 읽기 좋게 섹션 앞에는 🔹 같은 안내용 이모지를 가끔 쓰고, "
+    "위험이나 주의점에는 ⚠️, 흐름에는 ➡️ 정도만 써줘. 🔎는 쓰지 마. "
     "장식처럼 남발하지 말고 모든 문단과 불릿은 들여쓰기 없이 왼쪽 정렬해줘."
 )
 RESPONSE_VALIDATION_FAILURE_TEXT = "⚠️ 응답이 한국어 출력 규칙을 통과하지 못했습니다. 다시 요청해 주세요."
@@ -2216,13 +2218,21 @@ def normalize_response_text(text: str) -> str:
         normalize_markdown_tables(
             normalize_inline_latex(
                 sanitize_replacement_chars(
-                    strip_markdown(
-                        strip_think(text)
+                    strip_internal_context_markers(
+                        strip_markdown(
+                            strip_think(text)
+                        )
                     )
                 )
             )
         )
     ).strip()
+
+
+def strip_internal_context_markers(text: str) -> str:
+    if not text:
+        return text
+    return text.replace(ASSISTANT_CONTEXT_TRUNCATION_NOTICE, "")
 
 
 def normalize_plain_text_spacing(text: str) -> str:
@@ -3417,7 +3427,7 @@ def compact_assistant_context(content: str, max_chars: int) -> str:
     stripped = content.strip()
     if len(stripped) <= max_chars:
         return content
-    return f"{stripped[:max_chars].rstrip()}{ASSISTANT_CONTEXT_TRUNCATION_NOTICE}"
+    return f"{stripped[:max_chars].rstrip()}\n{ASSISTANT_CONTEXT_TRUNCATION_MARKER}"
 
 
 def build_llm_context_history(history: list[ChatMessage]) -> list[ChatMessage]:
