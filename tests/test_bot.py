@@ -971,6 +971,19 @@ def test_youtube_transcript_request_blocked_is_audio_fallback_eligible():
     assert "request_blocked" in bot.YOUTUBE_TRANSCRIPTION_FALLBACK_STATUSES
 
 
+def test_youtube_audio_worker_command_handles_dash_prefixed_video_ids():
+    assert bot.youtube_audio_worker_command("metadata", "-sowOoOeQz4")[-3:] == [
+        "metadata",
+        "--",
+        "-sowOoOeQz4",
+    ]
+    assert bot.youtube_audio_worker_command("transcribe", "-sowOoOeQz4")[-3:] == [
+        "transcribe",
+        "--",
+        "-sowOoOeQz4",
+    ]
+
+
 def test_run_youtube_audio_transcription_worker_reads_large_final_payload(monkeypatch):
     script = (
         "import json\n"

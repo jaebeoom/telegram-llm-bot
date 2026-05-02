@@ -1877,7 +1877,10 @@ def youtube_audio_worker_env() -> dict[str, str]:
 
 
 def youtube_audio_worker_command(*args: str) -> list[str]:
-    return [sys.executable, "-m", "telegram_llm_bot.youtube_audio_transcription", *args]
+    command = [sys.executable, "-m", "telegram_llm_bot.youtube_audio_transcription"]
+    if args and args[0] in {"metadata", "transcribe"} and len(args) > 1:
+        return [*command, args[0], "--", *args[1:]]
+    return [*command, *args]
 
 
 def parse_json_lines(text: str) -> list[dict]:
