@@ -1901,6 +1901,38 @@ def test_task_profile_overrides_model_and_reasoning(monkeypatch):
     assert profile.reasoning_effort == "xhigh"
 
 
+def test_context_subprofiles_fallback_to_context_profile(monkeypatch):
+    monkeypatch.setenv("LLM_CONTEXT_MODEL", "context-default")
+    monkeypatch.setenv("LLM_CONTEXT_REASONING_EFFORT", "high")
+    monkeypatch.delenv("LLM_CONTEXT_SUMMARY_MODEL", raising=False)
+    monkeypatch.delenv("LLM_CONTEXT_ANALYSIS_MODEL", raising=False)
+    monkeypatch.delenv("LLM_CONTEXT_SUMMARY_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("LLM_CONTEXT_ANALYSIS_REASONING_EFFORT", raising=False)
+    monkeypatch.setattr(bot, "MODEL_NAME", "default-model")
+    monkeypatch.setattr(bot, "LLM_REASONING_EFFORT", "")
+
+    summary_profile = bot.get_llm_task_profile("context_summary")
+    analysis_profile = bot.get_llm_task_profile("context_analysis")
+
+    assert summary_profile.model == "context-default"
+    assert summary_profile.reasoning_effort == "high"
+    assert analysis_profile.model == "context-default"
+    assert analysis_profile.reasoning_effort == "high"
+
+
+def test_prefetch_summary_profile_fallback_order(monkeypatch):
+    monkeypatch.setenv("LLM_SUMMARY_MODEL", "summary-model")
+    monkeypatch.setenv("LLM_PREFETCH_MODEL", "prefetch-model")
+    monkeypatch.delenv("LLM_PREFETCH_SUMMARY_MODEL", raising=False)
+    monkeypatch.setattr(bot, "MODEL_NAME", "default-model")
+
+    assert bot.get_llm_task_profile("prefetch_summary").model == "prefetch-model"
+
+    monkeypatch.delenv("LLM_PREFETCH_MODEL", raising=False)
+
+    assert bot.get_llm_task_profile("prefetch_summary").model == "summary-model"
+
+
 def test_disable_llm_reasoning_sets_template_and_openrouter_flags():
     payload = bot.disable_llm_reasoning({"model": "deepseek/deepseek-v4-pro"})
 
@@ -2114,6 +2146,9 @@ def test_cleanup_inactive_sessions_removes_expired_state_from_memory_only(monkey
 
 def test_prepare_messages_builds_fresh_system_prompt(monkeypatch):
     monkeypatch.setattr(bot, "build_system_prompt", lambda model_name: f"prompt-for-{model_name}")
+    for task in bot.LLM_TASK_NAMES:
+        monkeypatch.delenv(f"LLM_{task.upper()}_MODEL", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_MODEL", raising=False)
 
     messages = bot.prepare_messages(session_key(42), "안녕")
 
@@ -2389,6 +2424,47 @@ def test_build_chat_completion_payload_disables_thinking_for_light_context(monke
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
     assert payload["reasoning"] == {"effort": "none", "exclude": True, "enabled": False}
     assert payload["include_reasoning"] is False
+
+
+def test_select_llm_task_for_context_summary_and_analysis(monkeypatch):
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
+
+    assert bot.select_llm_task_for_reply("안녕", "") == "chat"
+    assert bot.select_llm_task_for_reply(bot.DEFAULT_CONTEXT_PROMPT, "[Web Article]\n본문") == "context_summary"
+    assert bot.select_llm_task_for_reply("요약해줘", "[Web Article]\n본문") == "context_summary"
+    assert bot.select_llm_task_for_reply("투자 함의를 검토해줘", "[Web Article]\n본문") == "context_analysis"
+
+
+def test_build_chat_completion_payload_uses_context_summary_model_without_reasoning(monkeypatch):
+    monkeypatch.setenv("LLM_CONTEXT_SUMMARY_MODEL", "deepseek/deepseek-v4-flash")
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
+
+    payload = bot.build_chat_completion_payload(
+        [{"role": "user", "content": "요약"}],
+        search_context="[Web Article]\n본문",
+        user_message="요약해줘",
+        task="context_summary",
+    )
+
+    assert payload["model"] == "deepseek/deepseek-v4-flash"
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_build_chat_completion_payload_uses_context_analysis_model_with_reasoning(monkeypatch):
+    monkeypatch.setenv("LLM_CONTEXT_ANALYSIS_MODEL", "deepseek/deepseek-v4-pro")
+    monkeypatch.setenv("LLM_CONTEXT_ANALYSIS_REASONING_EFFORT", "xhigh")
+    monkeypatch.setattr(bot, "ENABLE_THINKING_FOR_CONTEXT", False)
+
+    payload = bot.build_chat_completion_payload(
+        [{"role": "user", "content": "비판적으로 분석해줘"}],
+        search_context="[Web Article]\n본문",
+        user_message="비판적으로 분석해줘",
+        task="context_analysis",
+    )
+
+    assert payload["model"] == "deepseek/deepseek-v4-pro"
+    assert payload["reasoning"] == {"effort": "xhigh"}
+    assert "chat_template_kwargs" not in payload
 
 
 def test_build_chat_completion_payload_disables_thinking_for_default_context_prompt(monkeypatch):
@@ -3286,9 +3362,12 @@ def test_show_model_marks_unset_model(monkeypatch):
         "📦 현재 LLM task profiles\n"
         "- chat: (unset)\n"
         "- context: (unset)\n"
+        "- context_summary: (unset)\n"
+        "- context_analysis: (unset)\n"
         "- router: (unset)\n"
         "- summary: (unset)\n"
         "- rewrite: (unset)\n"
         "- prefetch: (unset)\n"
+        "- prefetch_summary: (unset)\n"
         "🔧 설정 소스: process env"
     ]

@@ -148,7 +148,22 @@ LLM_PROVIDER_DATA_COLLECTION = os.getenv("LLM_PROVIDER_DATA_COLLECTION", "").str
 LLM_REQUIRE_PARAMETERS = os.getenv("LLM_REQUIRE_PARAMETERS", "").strip().lower() in {"1", "true", "yes", "on"}
 LLM_ZERO_DATA_RETENTION = os.getenv("LLM_ZERO_DATA_RETENTION", "").strip().lower() in {"1", "true", "yes", "on"}
 LLM_ALLOW_FALLBACKS_RAW = os.getenv("LLM_ALLOW_FALLBACKS", "").strip().lower()
-LLM_TASK_NAMES = ("chat", "context", "router", "summary", "rewrite", "prefetch")
+LLM_TASK_NAMES = (
+    "chat",
+    "context",
+    "context_summary",
+    "context_analysis",
+    "router",
+    "summary",
+    "rewrite",
+    "prefetch",
+    "prefetch_summary",
+)
+LLM_TASK_FALLBACKS = {
+    "context_summary": ("context",),
+    "context_analysis": ("context",),
+    "prefetch_summary": ("prefetch", "summary"),
+}
 VAULT_CAPTURE_PATH = (
     os.getenv("VAULT_CAPTURE_PATH") or os.getenv("VAULT_HAIKU_PATH") or ""
 ).strip()
@@ -346,13 +361,24 @@ def parse_bool_value(raw_value: str | None, default: bool = False) -> bool:
     return default
 
 
-def resolve_task_env(task: str, suffix: str, default: str = "") -> str:
+def resolve_direct_task_env(task: str, suffix: str) -> str:
     task_key = env_task_key(task)
     return (
         os.getenv(f"LLM_{task_key}_{suffix}")
         or os.getenv(f"{task_key}_LLM_{suffix}")
-        or default
+        or ""
     ).strip()
+
+
+def resolve_task_env(task: str, suffix: str, default: str = "") -> str:
+    raw_value = resolve_direct_task_env(task, suffix)
+    if raw_value:
+        return raw_value
+    for fallback_task in LLM_TASK_FALLBACKS.get(task, ()):
+        fallback_value = resolve_direct_task_env(fallback_task, suffix)
+        if fallback_value:
+            return fallback_value
+    return default.strip()
 
 
 def resolve_task_api_key(task: str, base_url: str) -> str:
@@ -1451,7 +1477,7 @@ def deserialize_inbox_context_source(payload: str) -> InboxContextSource:
 
 
 def build_inbox_context_prefetch_summary_signature() -> str:
-    profile = get_llm_task_profile("prefetch")
+    profile = get_llm_task_profile("prefetch_summary")
     signature_payload = {
         "model_name": profile.model,
         "system_prompt": build_system_prompt(profile.model),
@@ -1624,7 +1650,7 @@ def summarize_inbox_context_source(source: InboxContextSource) -> str:
 
 
 def generate_inbox_context_initial_reply(source: InboxContextSource) -> str:
-    profile = get_llm_task_profile("prefetch")
+    profile = get_llm_task_profile("prefetch_summary")
     messages = [
         {"role": "system", "content": build_system_prompt(profile.model)},
         {
@@ -3683,6 +3709,14 @@ def should_allow_thinking_for_context(user_message: str) -> bool:
     return bool(CONTEXT_THINKING_TRIGGER_RE.search(user_message))
 
 
+def select_llm_task_for_reply(user_message: str, search_context: str = "") -> str:
+    if not search_context:
+        return "chat"
+    if should_allow_thinking_for_context(user_message):
+        return "context_analysis"
+    return "context_summary"
+
+
 def build_chat_completion_payload(
     messages: list[dict],
     search_context: str = "",
@@ -3690,6 +3724,8 @@ def build_chat_completion_payload(
     *,
     task: str = "chat",
 ) -> dict:
+    if task == "chat":
+        task = select_llm_task_for_reply(user_message, search_context)
     profile = get_llm_task_profile(task)
     payload = {
         "model": profile.model,
@@ -3697,7 +3733,7 @@ def build_chat_completion_payload(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if search_context and not should_allow_thinking_for_context(user_message):
+    if search_context and task != "context_analysis":
         disable_llm_reasoning(payload)
     else:
         apply_llm_request_options(payload, profile=profile)
@@ -3817,7 +3853,7 @@ async def stream_reply(
             preserve_active_source_context=source in {"auto_search", "search_suffix", "search_command"},
         )
     )
-    llm_task = "context" if effective_search_context else "chat"
+    llm_task = select_llm_task_for_reply(user_message, effective_search_context)
     llm_profile = get_llm_task_profile(llm_task)
     messages = prepare_messages(
         session_key,

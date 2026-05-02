@@ -58,36 +58,52 @@ Python 3.11을 명시적으로 고정하려면 `uv python pin 3.11`을 사용하
 
 ```env
 TELEGRAM_TOKEN=your_telegram_bot_token
+ALLOWED_USER_IDS=your_telegram_user_id
+
+# 공용 API shared env 예시: ../.shared-ai.env
+# LLM_DEFAULT_BASE_URL=https://openrouter.ai/api/v1
+# LLM_DEFAULT_API_KEY=your_provider_api_key
+LLM_PROVIDER_NAME=OpenAI-compatible
+
+LLM_DEFAULT_MODEL=deepseek/deepseek-v4-flash
+LLM_CHAT_MODEL=deepseek/deepseek-v4-pro
+LLM_CONTEXT_MODEL=deepseek/deepseek-v4-flash
+LLM_CONTEXT_SUMMARY_MODEL=deepseek/deepseek-v4-flash
+LLM_CONTEXT_ANALYSIS_MODEL=deepseek/deepseek-v4-pro
+LLM_ROUTER_MODEL=deepseek/deepseek-v4-flash
+LLM_SUMMARY_MODEL=deepseek/deepseek-v4-flash
+LLM_REWRITE_MODEL=gemma-4-26b-a4b-it-6bit
+LLM_PREFETCH_MODEL=deepseek/deepseek-v4-flash
+LLM_PREFETCH_SUMMARY_MODEL=gemma-4-26b-a4b-it-6bit
+
+# 로컬 OMLX에서만 처리할 task. 전부 API 모델이면 제거.
+LLM_REWRITE_BASE_URL=http://localhost:1234/v1
+LLM_REWRITE_API_KEY=
+LLM_PREFETCH_SUMMARY_BASE_URL=http://localhost:1234/v1
+LLM_PREFETCH_SUMMARY_API_KEY=
+
+LLM_CHAT_REASONING_EFFORT=xhigh
+LLM_CONTEXT_ANALYSIS_REASONING_EFFORT=xhigh
+LLM_REASONING_EFFORT=
+ENABLE_THINKING_FOR_CONTEXT=false
+
 TAVILY_API_KEY=your_tavily_api_key
 ENABLE_AUTO_SEARCH=true
-TELEGRAM_RESPONSE_DELIVERY=final
-ENABLE_THINKING_FOR_CONTEXT=true
-ALLOWED_USER_IDS=your_telegram_user_id
-LLM_PROVIDER_NAME=OpenAI-compatible
-LLM_DEFAULT_MODEL=deepseek/deepseek-v4-pro
-LLM_CHAT_MODEL=deepseek/deepseek-v4-pro
-LLM_CONTEXT_MODEL=deepseek/deepseek-v4-pro
-LLM_ROUTER_MODEL=deepseek/deepseek-v4-pro
-LLM_SUMMARY_MODEL=deepseek/deepseek-v4-pro
-LLM_REWRITE_MODEL=deepseek/deepseek-v4-pro
-LLM_PREFETCH_MODEL=deepseek/deepseek-v4-pro
-LLM_CHAT_REASONING_EFFORT=xhigh
-LLM_CONTEXT_REASONING_EFFORT=xhigh
-LLM_REASONING_EFFORT=
+TELEGRAM_RESPONSE_DELIVERY=draft
+
 LLM_PROVIDER_DATA_COLLECTION=deny
 LLM_REQUIRE_PARAMETERS=true
 LLM_ZERO_DATA_RETENTION=false
 
-# 공용 shared env 예시: ../.shared-ai.env
-# LLM_DEFAULT_BASE_URL=https://openrouter.ai/api/v1
-# LLM_DEFAULT_API_KEY=your_provider_api_key
 VAULT_CAPTURE_PATH=~/path/to/your/Vault/Capture
 INBOX_API_BASE_URL=http://localhost:8000
-INBOX_API_ACCESS_TOKEN=your_inbox_access_token
-INBOX_CONTEXT_SUMMARY_TIMEOUT_SECONDS=45
+# INBOX_API_ACCESS_TOKEN=your_inbox_access_token
+ENABLE_INBOX_CONTEXT_PREFETCH=true
+ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY=false
+
 ENABLE_RESPONSE_VALIDATION=true
-RESPONSE_REWRITE_TIMEOUT_SECONDS=45
-RESPONSE_REWRITE_MAX_ATTEMPTS=3
+ENABLE_PLAYWRIGHT_FALLBACK=true
+ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION=false
 ```
 
 ## 환경 변수
@@ -106,15 +122,18 @@ RESPONSE_REWRITE_MAX_ATTEMPTS=3
 | `ALLOWED_USER_IDS` | 허용할 Telegram user id 목록, 쉼표 구분 |
 | `LLM_DEFAULT_MODEL` / `MODEL_NAME` | task별 모델이 없을 때 사용할 기본 모델 이름. `MODEL_NAME`은 하위 호환 별칭 |
 | `LLM_CHAT_MODEL` | 일반 대화와 활성 컨텍스트 없는 후속 질문에 사용할 모델 |
-| `LLM_CONTEXT_MODEL` | URL/PDF/YouTube/Inbox/Web search 컨텍스트가 붙은 답변에 사용할 모델 |
+| `LLM_CONTEXT_MODEL` | 컨텍스트 답변 task의 기본 fallback 모델 |
+| `LLM_CONTEXT_SUMMARY_MODEL` | URL/PDF/YouTube/Inbox/Web search 컨텍스트를 명령 없이 넣거나 요약/정리할 때 사용할 모델. 없으면 `LLM_CONTEXT_MODEL` 사용 |
+| `LLM_CONTEXT_ANALYSIS_MODEL` | 컨텍스트 기반 검토/반박/비교/함의/투자 판단처럼 깊은 분석에 사용할 모델. 없으면 `LLM_CONTEXT_MODEL` 사용 |
 | `LLM_ROUTER_MODEL` | 자동 검색 필요 여부를 JSON으로 판정하는 짧은 routing 모델 |
 | `LLM_SUMMARY_MODEL` | `/ctx` 적용 직후 짧은 맥락 요약 helper에 사용할 모델 |
 | `LLM_REWRITE_MODEL` | 중국어/일본어 문자 등 출력 규칙 위반을 고치는 repair 모델 |
-| `LLM_PREFETCH_MODEL` | Inbox background prefetch summary/initial reply 생성에 사용할 모델 |
+| `LLM_PREFETCH_MODEL` | Inbox background prefetch 계열의 기본 fallback 모델 |
+| `LLM_PREFETCH_SUMMARY_MODEL` | `ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY=true`일 때 background initial reply 생성에 사용할 모델. 없으면 `LLM_PREFETCH_MODEL`, 그다음 `LLM_SUMMARY_MODEL` 사용 |
 | `OMLX_BASE_URL` / `OMLX_MODEL` / `OMLX_API_KEY` | 각각 기본 base URL / 기본 model / 기본 API key보다 우선하는 OMLX 전용 별칭 |
 | `LLM_REASONING_EFFORT` | task별 reasoning effort가 없을 때 쓰는 기본값 |
-| `LLM_CHAT_REASONING_EFFORT` / `LLM_CONTEXT_REASONING_EFFORT` / `LLM_ROUTER_REASONING_EFFORT` / `LLM_SUMMARY_REASONING_EFFORT` / `LLM_REWRITE_REASONING_EFFORT` / `LLM_PREFETCH_REASONING_EFFORT` | task별 reasoning effort. 빈 값이면 기본값을 따름 |
-| `LLM_<TASK>_BASE_URL` / `LLM_<TASK>_API_KEY` | 특정 task만 다른 OpenAI-compatible provider로 보낼 때 사용. `<TASK>`는 `CHAT`, `CONTEXT`, `ROUTER`, `SUMMARY`, `REWRITE`, `PREFETCH` |
+| `LLM_CHAT_REASONING_EFFORT` / `LLM_CONTEXT_REASONING_EFFORT` / `LLM_CONTEXT_SUMMARY_REASONING_EFFORT` / `LLM_CONTEXT_ANALYSIS_REASONING_EFFORT` / `LLM_ROUTER_REASONING_EFFORT` / `LLM_SUMMARY_REASONING_EFFORT` / `LLM_REWRITE_REASONING_EFFORT` / `LLM_PREFETCH_REASONING_EFFORT` / `LLM_PREFETCH_SUMMARY_REASONING_EFFORT` | task별 reasoning effort. 빈 값이면 fallback task 값, 그다음 기본값을 따름 |
+| `LLM_<TASK>_BASE_URL` / `LLM_<TASK>_API_KEY` | 특정 task만 다른 OpenAI-compatible provider로 보낼 때 사용. `<TASK>`는 `CHAT`, `CONTEXT`, `CONTEXT_SUMMARY`, `CONTEXT_ANALYSIS`, `ROUTER`, `SUMMARY`, `REWRITE`, `PREFETCH`, `PREFETCH_SUMMARY` |
 | `LLM_PROVIDER_DATA_COLLECTION` | OpenRouter provider routing의 `data_collection` 값. 데이터 수집 provider를 피하려면 `deny` |
 | `LLM_REQUIRE_PARAMETERS` | 기본값 `false`. `true`면 요청 parameter를 지원하는 provider로만 라우팅 |
 | `LLM_ZERO_DATA_RETENTION` | 기본값 `false`. `true`면 ZDR endpoint만 사용. 해당 모델 endpoint가 없으면 실패할 수 있음 |
