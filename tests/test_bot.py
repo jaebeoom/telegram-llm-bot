@@ -1843,8 +1843,11 @@ def test_validate_runtime_config_reports_missing_required_values(monkeypatch):
     monkeypatch.setattr(bot, "TELEGRAM_TOKEN", "")
     monkeypatch.setattr(bot, "MODEL_NAME", "")
     monkeypatch.setattr(bot, "SESSION_INACTIVE_TTL_CONFIG_ERROR", None)
+    for task in bot.LLM_TASK_NAMES:
+        monkeypatch.delenv(f"LLM_{task.upper()}_MODEL", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_MODEL", raising=False)
 
-    assert bot.validate_runtime_config() == ["TELEGRAM_TOKEN", "OMLX_MODEL or MODEL_NAME"]
+    assert bot.validate_runtime_config() == ["TELEGRAM_TOKEN", "LLM_CHAT_MODEL or MODEL_NAME"]
 
 
 def test_validate_runtime_config_accepts_present_required_values(monkeypatch):
@@ -1884,6 +1887,18 @@ def test_apply_llm_request_options_can_skip_reasoning(monkeypatch):
     assert "reasoning" not in payload
     assert payload["provider"] == {"allow_fallbacks": False}
     assert payload["zdr"] is True
+
+
+def test_task_profile_overrides_model_and_reasoning(monkeypatch):
+    monkeypatch.setenv("LLM_ROUTER_MODEL", "cheap-router")
+    monkeypatch.setenv("LLM_ROUTER_REASONING_EFFORT", "")
+    monkeypatch.setattr(bot, "MODEL_NAME", "default-model")
+    monkeypatch.setattr(bot, "LLM_REASONING_EFFORT", "xhigh")
+
+    profile = bot.get_llm_task_profile("router")
+
+    assert profile.model == "cheap-router"
+    assert profile.reasoning_effort == "xhigh"
 
 
 def test_disable_llm_reasoning_sets_template_and_openrouter_flags():
@@ -3256,6 +3271,9 @@ def test_clear_history_prunes_other_idle_scopes_after_current_clear(monkeypatch)
 def test_show_model_marks_unset_model(monkeypatch):
     monkeypatch.setattr(bot, "MODEL_NAME", "")
     monkeypatch.setattr(bot, "ENV_FILES_LOADED", [])
+    for task in bot.LLM_TASK_NAMES:
+        monkeypatch.delenv(f"LLM_{task.upper()}_MODEL", raising=False)
+    monkeypatch.delenv("LLM_DEFAULT_MODEL", raising=False)
 
     update = SimpleNamespace(
         effective_user=SimpleNamespace(id=1),
@@ -3264,4 +3282,13 @@ def test_show_model_marks_unset_model(monkeypatch):
 
     asyncio.run(bot.show_model(update, None))
 
-    assert update.message.replies == ["📦 현재 모델: (unset)\n🔧 설정 소스: process env"]
+    assert update.message.replies == [
+        "📦 현재 LLM task profiles\n"
+        "- chat: (unset)\n"
+        "- context: (unset)\n"
+        "- router: (unset)\n"
+        "- summary: (unset)\n"
+        "- rewrite: (unset)\n"
+        "- prefetch: (unset)\n"
+        "🔧 설정 소스: process env"
+    ]

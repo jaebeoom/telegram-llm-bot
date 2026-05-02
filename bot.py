@@ -131,21 +131,24 @@ TAVILY_API_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
 LLM_API_BASE_URL = (
     os.getenv("OMLX_BASE_URL")
     or os.getenv("LLM_API_BASE_URL")
+    or os.getenv("LLM_DEFAULT_BASE_URL")
     or os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
 )
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+LLM_DEFAULT_API_KEY = os.getenv("LLM_API_KEY", "") or os.getenv("LLM_DEFAULT_API_KEY", "")
 if "openrouter.ai" in LLM_API_BASE_URL.lower():
-    LLM_API_KEY = OPENROUTER_API_KEY or os.getenv("LLM_API_KEY", "") or os.getenv("OMLX_API_KEY", "")
+    LLM_API_KEY = OPENROUTER_API_KEY or LLM_DEFAULT_API_KEY or os.getenv("OMLX_API_KEY", "")
 else:
-    LLM_API_KEY = os.getenv("OMLX_API_KEY") or os.getenv("LLM_API_KEY", "") or OPENROUTER_API_KEY
+    LLM_API_KEY = os.getenv("OMLX_API_KEY") or LLM_DEFAULT_API_KEY or OPENROUTER_API_KEY
 LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER_NAME", "OMLX")
 ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "")
-MODEL_NAME = ((os.getenv("OMLX_MODEL") or os.getenv("MODEL_NAME")) or "").strip()
+MODEL_NAME = ((os.getenv("OMLX_MODEL") or os.getenv("MODEL_NAME") or os.getenv("LLM_DEFAULT_MODEL")) or "").strip()
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "").strip()
 LLM_PROVIDER_DATA_COLLECTION = os.getenv("LLM_PROVIDER_DATA_COLLECTION", "").strip()
 LLM_REQUIRE_PARAMETERS = os.getenv("LLM_REQUIRE_PARAMETERS", "").strip().lower() in {"1", "true", "yes", "on"}
 LLM_ZERO_DATA_RETENTION = os.getenv("LLM_ZERO_DATA_RETENTION", "").strip().lower() in {"1", "true", "yes", "on"}
 LLM_ALLOW_FALLBACKS_RAW = os.getenv("LLM_ALLOW_FALLBACKS", "").strip().lower()
+LLM_TASK_NAMES = ("chat", "context", "router", "summary", "rewrite", "prefetch")
 VAULT_CAPTURE_PATH = (
     os.getenv("VAULT_CAPTURE_PATH") or os.getenv("VAULT_HAIKU_PATH") or ""
 ).strip()
@@ -221,8 +224,8 @@ def validate_runtime_config() -> list[str]:
     missing: list[str] = []
     if not TELEGRAM_TOKEN:
         missing.append("TELEGRAM_TOKEN")
-    if not MODEL_NAME:
-        missing.append("OMLX_MODEL or MODEL_NAME")
+    if not get_llm_task_profile("chat").model:
+        missing.append("LLM_CHAT_MODEL or MODEL_NAME")
     if SESSION_INACTIVE_TTL_CONFIG_ERROR:
         missing.append(SESSION_INACTIVE_TTL_CONFIG_ERROR)
     return missing
@@ -306,6 +309,19 @@ class TypingIndicator:
     task: asyncio.Task
 
 
+@dataclass(frozen=True)
+class LLMTaskProfile:
+    task: str
+    model: str
+    base_url: str
+    api_key: str
+    reasoning_effort: str
+    provider_data_collection: str
+    require_parameters: bool
+    zero_data_retention: bool
+    allow_fallbacks_raw: str
+
+
 _active_typing_indicator: ContextVar[TypingIndicator | None] = ContextVar(
     "active_typing_indicator",
     default=None,
@@ -313,6 +329,67 @@ _active_typing_indicator: ContextVar[TypingIndicator | None] = ContextVar(
 ENABLE_AUTO_SEARCH = parse_bool_env("ENABLE_AUTO_SEARCH", True)
 ENABLE_RESPONSE_VALIDATION = parse_bool_env("ENABLE_RESPONSE_VALIDATION", True)
 ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION = parse_bool_env("ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION", False)
+
+
+def env_task_key(task: str) -> str:
+    return task.upper().replace("-", "_")
+
+
+def parse_bool_value(raw_value: str | None, default: bool = False) -> bool:
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in TRUE_ENV_VALUES:
+        return True
+    if normalized in FALSE_ENV_VALUES:
+        return False
+    return default
+
+
+def resolve_task_env(task: str, suffix: str, default: str = "") -> str:
+    task_key = env_task_key(task)
+    return (
+        os.getenv(f"LLM_{task_key}_{suffix}")
+        or os.getenv(f"{task_key}_LLM_{suffix}")
+        or default
+    ).strip()
+
+
+def resolve_task_api_key(task: str, base_url: str) -> str:
+    raw_key = resolve_task_env(task, "API_KEY")
+    if raw_key:
+        return raw_key
+    if "openrouter.ai" in base_url.lower():
+        return OPENROUTER_API_KEY or LLM_API_KEY
+    return LLM_API_KEY
+
+
+def build_llm_task_profile(task: str) -> LLMTaskProfile:
+    base_url = resolve_task_env(task, "BASE_URL", LLM_API_BASE_URL)
+    reasoning_effort = resolve_task_env(task, "REASONING_EFFORT", LLM_REASONING_EFFORT)
+    require_parameters_raw = resolve_task_env(task, "REQUIRE_PARAMETERS")
+    zdr_raw = resolve_task_env(task, "ZERO_DATA_RETENTION")
+    return LLMTaskProfile(
+        task=task,
+        model=resolve_task_env(task, "MODEL", MODEL_NAME),
+        base_url=base_url,
+        api_key=resolve_task_api_key(task, base_url),
+        reasoning_effort=reasoning_effort,
+        provider_data_collection=resolve_task_env(
+            task,
+            "PROVIDER_DATA_COLLECTION",
+            LLM_PROVIDER_DATA_COLLECTION,
+        ),
+        require_parameters=parse_bool_value(require_parameters_raw, LLM_REQUIRE_PARAMETERS),
+        zero_data_retention=parse_bool_value(zdr_raw, LLM_ZERO_DATA_RETENTION),
+        allow_fallbacks_raw=resolve_task_env(task, "ALLOW_FALLBACKS", LLM_ALLOW_FALLBACKS_RAW).lower(),
+    )
+
+
+def get_llm_task_profile(task: str = "chat") -> LLMTaskProfile:
+    if task in LLM_TASK_NAMES:
+        return build_llm_task_profile(task)
+    return build_llm_task_profile("chat")
 
 
 def parse_positive_float_env(name: str, default: float) -> float:
@@ -468,6 +545,13 @@ logger.info(
     ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY,
     ENABLE_INBOX_CONTEXT_PREFETCH_STARTUP_SUMMARY,
     bool(INBOX_CONTEXT_PREFETCH_PERSISTENT_CACHE_PATH),
+)
+logger.info(
+    "LLM task profiles %s",
+    " ".join(
+        f"{task}={get_llm_task_profile(task).model or '(unset)'}"
+        for task in LLM_TASK_NAMES
+    ),
 )
 
 
@@ -681,40 +765,49 @@ class SourceMemory:
     created_at: float
 
 
-def build_chat_completions_url() -> str:
+def build_chat_completions_url(profile: LLMTaskProfile | None = None) -> str:
     """OpenAI-compatible base URL에서 chat/completions endpoint 생성."""
-    return f"{LLM_API_BASE_URL.rstrip('/')}/chat/completions"
+    resolved_profile = profile or get_llm_task_profile("chat")
+    return f"{resolved_profile.base_url.rstrip('/')}/chat/completions"
 
 
-def build_llm_headers() -> dict[str, str]:
+def build_llm_headers(profile: LLMTaskProfile | None = None) -> dict[str, str]:
+    resolved_profile = profile or get_llm_task_profile("chat")
     headers = {"Content-Type": "application/json"}
-    if LLM_API_KEY:
-        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+    if resolved_profile.api_key:
+        headers["Authorization"] = f"Bearer {resolved_profile.api_key}"
     return headers
 
 
-def build_llm_provider_options() -> dict:
+def build_llm_provider_options(profile: LLMTaskProfile | None = None) -> dict:
+    resolved_profile = profile or get_llm_task_profile("chat")
     provider: dict[str, object] = {}
-    if LLM_PROVIDER_DATA_COLLECTION:
-        provider["data_collection"] = LLM_PROVIDER_DATA_COLLECTION
-    if LLM_REQUIRE_PARAMETERS:
+    if resolved_profile.provider_data_collection:
+        provider["data_collection"] = resolved_profile.provider_data_collection
+    if resolved_profile.require_parameters:
         provider["require_parameters"] = True
-    if LLM_ALLOW_FALLBACKS_RAW in {"1", "true", "yes", "on"}:
+    if resolved_profile.allow_fallbacks_raw in {"1", "true", "yes", "on"}:
         provider["allow_fallbacks"] = True
-    elif LLM_ALLOW_FALLBACKS_RAW in {"0", "false", "no", "off"}:
+    elif resolved_profile.allow_fallbacks_raw in {"0", "false", "no", "off"}:
         provider["allow_fallbacks"] = False
     return provider
 
 
-def apply_llm_request_options(payload: dict, *, allow_reasoning: bool = True) -> dict:
-    if allow_reasoning and LLM_REASONING_EFFORT:
-        payload["reasoning"] = {"effort": LLM_REASONING_EFFORT}
+def apply_llm_request_options(
+    payload: dict,
+    *,
+    allow_reasoning: bool = True,
+    profile: LLMTaskProfile | None = None,
+) -> dict:
+    resolved_profile = profile or get_llm_task_profile("chat")
+    if allow_reasoning and resolved_profile.reasoning_effort:
+        payload["reasoning"] = {"effort": resolved_profile.reasoning_effort}
 
-    provider = build_llm_provider_options()
+    provider = build_llm_provider_options(resolved_profile)
     if provider:
         payload["provider"] = provider
 
-    if LLM_ZERO_DATA_RETENTION:
+    if resolved_profile.zero_data_retention:
         payload["zdr"] = True
 
     return payload
@@ -812,8 +905,9 @@ def extract_json_object(text: str) -> dict | None:
 
 
 def classify_recency_need(user_message: str, session_key: SessionKey | None = None) -> AutoSearchDecision:
+    profile = get_llm_task_profile("router")
     payload = {
-        "model": MODEL_NAME,
+        "model": profile.model,
         "messages": build_recency_classifier_messages(user_message, session_key=session_key),
         "stream": False,
         "temperature": 0,
@@ -822,8 +916,8 @@ def classify_recency_need(user_message: str, session_key: SessionKey | None = No
     disable_llm_reasoning(payload)
 
     response = requests.post(
-        build_chat_completions_url(),
-        headers=build_llm_headers(),
+        build_chat_completions_url(profile),
+        headers=build_llm_headers(profile),
         json=payload,
         timeout=AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS,
     )
@@ -1357,9 +1451,10 @@ def deserialize_inbox_context_source(payload: str) -> InboxContextSource:
 
 
 def build_inbox_context_prefetch_summary_signature() -> str:
+    profile = get_llm_task_profile("prefetch")
     signature_payload = {
-        "model_name": MODEL_NAME,
-        "system_prompt": build_system_prompt(MODEL_NAME),
+        "model_name": profile.model,
+        "system_prompt": build_system_prompt(profile.model),
         "context_prompt": build_context_prompt(DEFAULT_CONTEXT_PROMPT),
         "enable_thinking_for_context": ENABLE_THINKING_FOR_CONTEXT,
         "summary_enabled": ENABLE_INBOX_CONTEXT_PREFETCH_SUMMARY,
@@ -1499,8 +1594,9 @@ def build_inbox_context_summary_messages(source: InboxContextSource) -> list[dic
 
 
 def summarize_inbox_context_source(source: InboxContextSource) -> str:
+    profile = get_llm_task_profile("summary")
     payload = {
-        "model": MODEL_NAME,
+        "model": profile.model,
         "messages": build_inbox_context_summary_messages(source),
         "stream": False,
         "temperature": 0.2,
@@ -1508,8 +1604,8 @@ def summarize_inbox_context_source(source: InboxContextSource) -> str:
     }
     disable_llm_reasoning(payload)
     response = requests.post(
-        build_chat_completions_url(),
-        headers=build_llm_headers(),
+        build_chat_completions_url(profile),
+        headers=build_llm_headers(profile),
         json=payload,
         timeout=INBOX_CONTEXT_SUMMARY_TIMEOUT_SECONDS,
     )
@@ -1528,8 +1624,9 @@ def summarize_inbox_context_source(source: InboxContextSource) -> str:
 
 
 def generate_inbox_context_initial_reply(source: InboxContextSource) -> str:
+    profile = get_llm_task_profile("prefetch")
     messages = [
-        {"role": "system", "content": build_system_prompt(MODEL_NAME)},
+        {"role": "system", "content": build_system_prompt(profile.model)},
         {
             "role": "user",
             "content": build_augmented_context_message(
@@ -1539,18 +1636,18 @@ def generate_inbox_context_initial_reply(source: InboxContextSource) -> str:
         },
     ]
     payload = {
-        "model": MODEL_NAME,
+        "model": profile.model,
         "messages": messages,
         "stream": False,
     }
     if source.text and not ENABLE_THINKING_FOR_CONTEXT:
         disable_llm_reasoning(payload)
     else:
-        apply_llm_request_options(payload)
+        apply_llm_request_options(payload, profile=profile)
 
     response = requests.post(
-        build_chat_completions_url(),
-        headers=build_llm_headers(),
+        build_chat_completions_url(profile),
+        headers=build_llm_headers(profile),
         json=payload,
         timeout=INBOX_CONTEXT_PREFETCH_SUMMARY_TIMEOUT_SECONDS,
     )
@@ -1958,7 +2055,7 @@ def save_session_to_vault(session_key: SessionKey) -> bool:
     # 대화를 MD로 포맷
     now = datetime.now().strftime("%H:%M")
     session_identifier = session_identifiers.get(session_key)
-    session_md = f"\n\n---\n\n## AI 세션 ({now}, {MODEL_NAME})\n"
+    session_md = f"\n\n---\n\n## AI 세션 ({now}, {get_llm_task_profile('chat').model})\n"
     if session_identifier:
         session_md += f"{build_capture_session_marker(session_identifier)}\n"
     session_md += "\n"
@@ -2342,17 +2439,19 @@ def rewrite_invalid_response(
     issue: str,
     attempt: int = 1,
 ) -> str:
+    profile = get_llm_task_profile("rewrite")
     payload = {
-        "model": MODEL_NAME,
+        "model": profile.model,
         "messages": build_response_rewrite_messages(original_text, user_message, search_context, issue, attempt),
         "stream": False,
         "temperature": 0,
-        "chat_template_kwargs": {"enable_thinking": False},
     }
+    disable_llm_reasoning(payload)
+    apply_llm_request_options(payload, allow_reasoning=False, profile=profile)
 
     response = requests.post(
-        build_chat_completions_url(),
-        headers=build_llm_headers(),
+        build_chat_completions_url(profile),
+        headers=build_llm_headers(profile),
         json=payload,
         timeout=RESPONSE_REWRITE_TIMEOUT_SECONDS,
     )
@@ -3545,6 +3644,7 @@ def prepare_messages(
     source_kind: str | None = None,
     source_url: str | None = None,
     store_context_in_history: bool = True,
+    model_name: str | None = None,
 ) -> list:
 
     if search_context:
@@ -3562,7 +3662,7 @@ def prepare_messages(
         source_kind=source_kind,
         source_url=source_url,
     )
-    system_prompt = build_system_prompt(MODEL_NAME)
+    system_prompt = build_system_prompt(model_name or get_llm_task_profile("chat").model)
     if apply_source_followup or not store_context_in_history:
         payload_history = conversations[session_key][:-1] + [{"role": "user", "content": payload_message}]
     else:
@@ -3587,9 +3687,12 @@ def build_chat_completion_payload(
     messages: list[dict],
     search_context: str = "",
     user_message: str = "",
+    *,
+    task: str = "chat",
 ) -> dict:
+    profile = get_llm_task_profile(task)
     payload = {
-        "model": MODEL_NAME,
+        "model": profile.model,
         "messages": messages,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -3597,7 +3700,7 @@ def build_chat_completion_payload(
     if search_context and not should_allow_thinking_for_context(user_message):
         disable_llm_reasoning(payload)
     else:
-        apply_llm_request_options(payload)
+        apply_llm_request_options(payload, profile=profile)
     return payload
 
 
@@ -3616,11 +3719,14 @@ def extract_reasoning_tokens(usage: dict | None) -> int | None:
 
 
 def _stream_llm_response(payload: dict, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue):
+    task = str(payload.get("_llm_task") or "chat")
+    resolved_profile = get_llm_task_profile(task)
+    request_payload = {key: value for key, value in payload.items() if not key.startswith("_llm_")}
     try:
         with requests.post(
-            build_chat_completions_url(),
-            headers=build_llm_headers(),
-            json=payload,
+            build_chat_completions_url(resolved_profile),
+            headers=build_llm_headers(resolved_profile),
+            json=request_payload,
             stream=True,
             timeout=120,
         ) as response:
@@ -3711,6 +3817,8 @@ async def stream_reply(
             preserve_active_source_context=source in {"auto_search", "search_suffix", "search_command"},
         )
     )
+    llm_task = "context" if effective_search_context else "chat"
+    llm_profile = get_llm_task_profile(llm_task)
     messages = prepare_messages(
         session_key,
         user_message,
@@ -3718,12 +3826,15 @@ async def stream_reply(
         source_kind=effective_source_kind,
         source_url=effective_source_url,
         store_context_in_history=store_context_in_history,
+        model_name=llm_profile.model,
     )
     request_payload = build_chat_completion_payload(
         messages,
         effective_search_context,
         user_message=user_message,
+        task=llm_task,
     )
+    request_payload["_llm_task"] = llm_task
     reasoning_disabled = bool(request_payload.get("chat_template_kwargs", {}).get("enable_thinking") is False)
 
     bot_msg = status_message
@@ -3992,9 +4103,11 @@ async def stream_reply(
         first_visible_ms = int((first_visible_at - stream_started_at) * 1000) if first_visible_at else None
         reasoning_tokens = extract_reasoning_tokens(usage_data)
         logger.info(
-            "Stream metrics user=%s source=%s mode=%s reasoning_disabled=%s reasoning_used=%s reasoning_chars=%s reasoning_tokens=%s first_token_ms=%s first_reasoning_ms=%s first_content_ms=%s first_visible_ms=%s total_ms=%s updates=%s chars=%s",
+            "Stream metrics user=%s source=%s task=%s model=%s mode=%s reasoning_disabled=%s reasoning_used=%s reasoning_chars=%s reasoning_tokens=%s first_token_ms=%s first_reasoning_ms=%s first_content_ms=%s first_visible_ms=%s total_ms=%s updates=%s chars=%s",
             user_id,
             source,
+            llm_task,
+            llm_profile.model,
             "draft-disabled" if draft_stream_disabled else ("draft" if use_message_draft else ("edit" if stream_to_telegram else "final")),
             reasoning_disabled,
             reasoning_used,
@@ -4468,8 +4581,12 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     env_hint = Path(ENV_FILES_LOADED[-1]).name if ENV_FILES_LOADED else "process env"
-    model_name = MODEL_NAME or "(unset)"
-    await update.message.reply_text(f"📦 현재 모델: {model_name}\n🔧 설정 소스: {env_hint}")
+    lines = ["📦 현재 LLM task profiles"]
+    for task in LLM_TASK_NAMES:
+        profile = get_llm_task_profile(task)
+        lines.append(f"- {task}: {profile.model or '(unset)'}")
+    lines.append(f"🔧 설정 소스: {env_hint}")
+    await update.message.reply_text("\n".join(lines))
 
 
 BOT_MENU_COMMANDS = [
