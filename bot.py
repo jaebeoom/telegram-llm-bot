@@ -327,6 +327,7 @@ class TypingIndicator:
 @dataclass(frozen=True)
 class LLMTaskProfile:
     task: str
+    provider_name: str
     model: str
     base_url: str
     api_key: str
@@ -381,25 +382,75 @@ def resolve_task_env(task: str, suffix: str, default: str = "") -> str:
     return default.strip()
 
 
-def resolve_task_api_key(task: str, base_url: str) -> str:
+def normalize_provider_name(provider_name: str) -> str:
+    return provider_name.strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def provider_env_key(provider_name: str) -> str:
+    return normalize_provider_name(provider_name).upper().replace("-", "_")
+
+
+def resolve_provider_env(provider_name: str, suffix: str) -> str:
+    provider_key = provider_env_key(provider_name)
+    return (os.getenv(f"LLM_PROVIDER_{provider_key}_{suffix}") or "").strip()
+
+
+def resolve_provider_base_url(provider_name: str) -> str:
+    normalized = normalize_provider_name(provider_name)
+    registered_base_url = resolve_provider_env(provider_name, "BASE_URL")
+    if registered_base_url:
+        return registered_base_url
+    if normalized in {"openrouter", "open-router"}:
+        return "https://openrouter.ai/api/v1"
+    if normalized in {"omlx", "o-mlx", "local", "local-llm", "local-provider"}:
+        return os.getenv("OMLX_BASE_URL") or "http://localhost:1234/v1"
+    if normalize_provider_name(LLM_PROVIDER_NAME) == normalized:
+        return LLM_API_BASE_URL
+    return ""
+
+
+def resolve_provider_api_key(provider_name: str, base_url: str) -> str:
+    normalized = normalize_provider_name(provider_name)
+    registered_api_key = resolve_provider_env(provider_name, "API_KEY")
+    if registered_api_key:
+        return registered_api_key
+    if normalized in {"openrouter", "open-router"} or "openrouter.ai" in base_url.lower():
+        return OPENROUTER_API_KEY or LLM_DEFAULT_API_KEY or LLM_API_KEY
+    if normalized in {"omlx", "o-mlx", "local", "local-llm", "local-provider"}:
+        return os.getenv("OMLX_API_KEY", "")
+    if normalize_provider_name(LLM_PROVIDER_NAME) == normalized:
+        return LLM_API_KEY
+    return ""
+
+
+def resolve_task_api_key(task: str, provider_name: str, base_url: str) -> str:
     raw_key = resolve_task_env(task, "API_KEY")
     if raw_key:
         return raw_key
+    normalized_provider = normalize_provider_name(provider_name)
+    if normalized_provider in {"omlx", "o-mlx", "local", "local-llm", "local-provider"}:
+        return os.getenv("OMLX_API_KEY", "")
+    provider_key = resolve_provider_api_key(provider_name, base_url)
+    if provider_key:
+        return provider_key
     if "openrouter.ai" in base_url.lower():
         return OPENROUTER_API_KEY or LLM_API_KEY
     return LLM_API_KEY
 
 
 def build_llm_task_profile(task: str) -> LLMTaskProfile:
-    base_url = resolve_task_env(task, "BASE_URL", LLM_API_BASE_URL)
+    provider_name = resolve_task_env(task, "PROVIDER_NAME", LLM_PROVIDER_NAME)
+    provider_base_url = resolve_provider_base_url(provider_name)
+    base_url = resolve_task_env(task, "BASE_URL", provider_base_url or LLM_API_BASE_URL)
     reasoning_effort = resolve_task_env(task, "REASONING_EFFORT", LLM_REASONING_EFFORT)
     require_parameters_raw = resolve_task_env(task, "REQUIRE_PARAMETERS")
     zdr_raw = resolve_task_env(task, "ZERO_DATA_RETENTION")
     return LLMTaskProfile(
         task=task,
+        provider_name=provider_name,
         model=resolve_task_env(task, "MODEL", MODEL_NAME),
         base_url=base_url,
-        api_key=resolve_task_api_key(task, base_url),
+        api_key=resolve_task_api_key(task, provider_name, base_url),
         reasoning_effort=reasoning_effort,
         provider_data_collection=resolve_task_env(
             task,
@@ -4623,7 +4674,7 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📦 현재 LLM task profiles"]
     for task in LLM_TASK_NAMES:
         profile = get_llm_task_profile(task)
-        lines.append(f"- {task}: {profile.model or '(unset)'}")
+        lines.append(f"- {task}: {profile.model or '(unset)'} ({profile.provider_name or 'provider unset'})")
     lines.append(f"🔧 설정 소스: {env_hint}")
     await update.message.reply_text("\n".join(lines))
 

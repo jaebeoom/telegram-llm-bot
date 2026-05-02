@@ -1914,6 +1914,66 @@ def test_task_profile_overrides_model_and_reasoning(monkeypatch):
     assert profile.reasoning_effort == "xhigh"
 
 
+def test_task_profile_provider_name_resolves_local_llm_defaults(monkeypatch):
+    monkeypatch.setenv("LLM_REWRITE_PROVIDER_NAME", "local-llm")
+    monkeypatch.delenv("LLM_REWRITE_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_REWRITE_API_KEY", raising=False)
+    monkeypatch.delenv("OMLX_BASE_URL", raising=False)
+    monkeypatch.delenv("OMLX_API_KEY", raising=False)
+    monkeypatch.setattr(bot, "LLM_PROVIDER_NAME", "OpenRouter")
+    monkeypatch.setattr(bot, "LLM_API_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setattr(bot, "LLM_API_KEY", "openrouter-key")
+
+    profile = bot.get_llm_task_profile("rewrite")
+
+    assert profile.provider_name == "local-llm"
+    assert profile.base_url == "http://localhost:1234/v1"
+    assert profile.api_key == ""
+
+
+def test_task_profile_provider_name_uses_openrouter_key(monkeypatch):
+    monkeypatch.setenv("LLM_ROUTER_PROVIDER_NAME", "OpenRouter")
+    monkeypatch.delenv("LLM_ROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_ROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(bot, "OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setattr(bot, "LLM_DEFAULT_API_KEY", "")
+    monkeypatch.setattr(bot, "LLM_API_KEY", "default-key")
+
+    profile = bot.get_llm_task_profile("router")
+
+    assert profile.provider_name == "OpenRouter"
+    assert profile.base_url == "https://openrouter.ai/api/v1"
+    assert profile.api_key == "or-key"
+
+
+def test_task_profile_provider_name_uses_env_provider_registry(monkeypatch):
+    monkeypatch.setenv("LLM_ROUTER_PROVIDER_NAME", "fireworks")
+    monkeypatch.setenv("LLM_PROVIDER_FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1")
+    monkeypatch.setenv("LLM_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    monkeypatch.delenv("LLM_ROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_ROUTER_API_KEY", raising=False)
+
+    profile = bot.get_llm_task_profile("router")
+
+    assert profile.provider_name == "fireworks"
+    assert profile.base_url == "https://api.fireworks.ai/inference/v1"
+    assert profile.api_key == "fw-key"
+
+
+def test_task_profile_direct_base_url_overrides_provider_registry(monkeypatch):
+    monkeypatch.setenv("LLM_ROUTER_PROVIDER_NAME", "fireworks")
+    monkeypatch.setenv("LLM_PROVIDER_FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1")
+    monkeypatch.setenv("LLM_PROVIDER_FIREWORKS_API_KEY", "fw-key")
+    monkeypatch.setenv("LLM_ROUTER_BASE_URL", "https://router.example/v1")
+    monkeypatch.setenv("LLM_ROUTER_API_KEY", "router-key")
+
+    profile = bot.get_llm_task_profile("router")
+
+    assert profile.provider_name == "fireworks"
+    assert profile.base_url == "https://router.example/v1"
+    assert profile.api_key == "router-key"
+
+
 def test_context_subprofiles_fallback_to_context_profile(monkeypatch):
     monkeypatch.setenv("LLM_CONTEXT_MODEL", "context-default")
     monkeypatch.setenv("LLM_CONTEXT_REASONING_EFFORT", "high")
@@ -3360,8 +3420,10 @@ def test_clear_history_prunes_other_idle_scopes_after_current_clear(monkeypatch)
 def test_show_model_marks_unset_model(monkeypatch):
     monkeypatch.setattr(bot, "MODEL_NAME", "")
     monkeypatch.setattr(bot, "ENV_FILES_LOADED", [])
+    monkeypatch.setattr(bot, "LLM_PROVIDER_NAME", "OpenRouter")
     for task in bot.LLM_TASK_NAMES:
         monkeypatch.delenv(f"LLM_{task.upper()}_MODEL", raising=False)
+        monkeypatch.delenv(f"LLM_{task.upper()}_PROVIDER_NAME", raising=False)
     monkeypatch.delenv("LLM_DEFAULT_MODEL", raising=False)
 
     update = SimpleNamespace(
@@ -3373,14 +3435,14 @@ def test_show_model_marks_unset_model(monkeypatch):
 
     assert update.message.replies == [
         "📦 현재 LLM task profiles\n"
-        "- chat: (unset)\n"
-        "- context: (unset)\n"
-        "- context_summary: (unset)\n"
-        "- context_analysis: (unset)\n"
-        "- router: (unset)\n"
-        "- summary: (unset)\n"
-        "- rewrite: (unset)\n"
-        "- prefetch: (unset)\n"
-        "- prefetch_summary: (unset)\n"
+        "- chat: (unset) (OpenRouter)\n"
+        "- context: (unset) (OpenRouter)\n"
+        "- context_summary: (unset) (OpenRouter)\n"
+        "- context_analysis: (unset) (OpenRouter)\n"
+        "- router: (unset) (OpenRouter)\n"
+        "- summary: (unset) (OpenRouter)\n"
+        "- rewrite: (unset) (OpenRouter)\n"
+        "- prefetch: (unset) (OpenRouter)\n"
+        "- prefetch_summary: (unset) (OpenRouter)\n"
         "🔧 설정 소스: process env"
     ]
