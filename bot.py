@@ -132,7 +132,7 @@ LLM_API_BASE_URL = (
     os.getenv("OMLX_BASE_URL")
     or os.getenv("LLM_API_BASE_URL")
     or os.getenv("LLM_DEFAULT_BASE_URL")
-    or os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
+    or os.getenv("LM_STUDIO_URL", "http://127.0.0.1:8001/v1")
 )
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 LLM_DEFAULT_API_KEY = os.getenv("LLM_API_KEY", "") or os.getenv("LLM_DEFAULT_API_KEY", "")
@@ -403,7 +403,7 @@ def resolve_provider_base_url(provider_name: str) -> str:
     if normalized in {"openrouter", "open-router"}:
         return "https://openrouter.ai/api/v1"
     if normalized in {"omlx", "o-mlx", "local", "local-llm", "local-provider"}:
-        return os.getenv("OMLX_BASE_URL") or "http://localhost:1234/v1"
+        return os.getenv("OMLX_BASE_URL") or "http://127.0.0.1:8001/v1"
     if normalize_provider_name(LLM_PROVIDER_NAME) == normalized:
         return LLM_API_BASE_URL
     return ""
@@ -427,12 +427,12 @@ def resolve_task_api_key(task: str, provider_name: str, base_url: str) -> str:
     raw_key = resolve_task_env(task, "API_KEY")
     if raw_key:
         return raw_key
-    normalized_provider = normalize_provider_name(provider_name)
-    if normalized_provider in {"omlx", "o-mlx", "local", "local-llm", "local-provider"}:
-        return os.getenv("OMLX_API_KEY", "")
     provider_key = resolve_provider_api_key(provider_name, base_url)
     if provider_key:
         return provider_key
+    normalized_provider = normalize_provider_name(provider_name)
+    if normalized_provider in {"omlx", "o-mlx", "local", "local-llm", "local-provider"}:
+        return os.getenv("OMLX_API_KEY", "")
     if "openrouter.ai" in base_url.lower():
         return OPENROUTER_API_KEY or LLM_API_KEY
     return LLM_API_KEY

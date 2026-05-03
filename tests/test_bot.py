@@ -1927,7 +1927,7 @@ def test_task_profile_provider_name_resolves_local_llm_defaults(monkeypatch):
     profile = bot.get_llm_task_profile("rewrite")
 
     assert profile.provider_name == "local-llm"
-    assert profile.base_url == "http://localhost:1234/v1"
+    assert profile.base_url == "http://127.0.0.1:8001/v1"
     assert profile.api_key == ""
 
 
@@ -1944,6 +1944,22 @@ def test_task_profile_provider_name_uses_openrouter_key(monkeypatch):
     assert profile.provider_name == "OpenRouter"
     assert profile.base_url == "https://openrouter.ai/api/v1"
     assert profile.api_key == "or-key"
+
+
+def test_task_profile_omlx_provider_uses_env_provider_registry(monkeypatch):
+    monkeypatch.setenv("LLM_REWRITE_PROVIDER_NAME", "oMLX")
+    monkeypatch.setenv("LLM_PROVIDER_OMLX_BASE_URL", "http://127.0.0.1:8001/v1")
+    monkeypatch.setenv("LLM_PROVIDER_OMLX_API_KEY", "omlx-provider-key")
+    monkeypatch.delenv("LLM_REWRITE_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_REWRITE_API_KEY", raising=False)
+    monkeypatch.delenv("OMLX_BASE_URL", raising=False)
+    monkeypatch.delenv("OMLX_API_KEY", raising=False)
+
+    profile = bot.get_llm_task_profile("rewrite")
+
+    assert profile.provider_name == "oMLX"
+    assert profile.base_url == "http://127.0.0.1:8001/v1"
+    assert profile.api_key == "omlx-provider-key"
 
 
 def test_task_profile_provider_name_uses_env_provider_registry(monkeypatch):
@@ -2650,6 +2666,7 @@ def test_save_session_to_vault_uses_full_session_history(tmp_path, monkeypatch):
 def test_save_session_to_vault_writes_session_marker_below_header(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "VAULT_CAPTURE_PATH", str(tmp_path))
     monkeypatch.setattr(bot, "generate_tags", lambda history: "#test-tag")
+    monkeypatch.setattr(bot, "MODEL_NAME", "test-model")
     key = session_key(56)
 
     bot.session_histories[key] = [
@@ -2694,6 +2711,7 @@ def test_save_session_to_vault_writes_source_comment_below_user_block(tmp_path, 
 def test_save_session_to_vault_keeps_legacy_format_when_identifier_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "VAULT_CAPTURE_PATH", str(tmp_path))
     monkeypatch.setattr(bot, "generate_tags", lambda history: "#test-tag")
+    monkeypatch.setattr(bot, "MODEL_NAME", "test-model")
     key = session_key(57)
 
     bot.session_histories[key] = [

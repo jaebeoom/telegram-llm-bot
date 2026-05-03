@@ -60,19 +60,14 @@ Python 3.11을 명시적으로 고정하려면 `uv python pin 3.11`을 사용하
 TELEGRAM_TOKEN=your_telegram_bot_token
 ALLOWED_USER_IDS=your_telegram_user_id
 
-# 공용 provider 설정은 보통 ../.shared-ai.env에 둡니다.
-#   LLM_PROVIDER_NAME=shared-provider
-#   LLM_API_BASE_URL=https://openrouter.ai/api/v1
-#   LLM_API_KEY=your_openrouter_api_key
-#
-# 공용 provider가 로컬 oMLX라면 같은 key에 oMLX endpoint를 넣으면 됩니다.
-#   LLM_PROVIDER_NAME=local-llm
-#   LLM_API_BASE_URL=http://localhost:1234/v1
-#   LLM_API_KEY=
-
-LLM_PROVIDER_NAME=shared-provider
+# Provider endpoints and keys live in ../.shared-ai.env, for example:
+#   LLM_PROVIDER_OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+#   LLM_PROVIDER_OPENROUTER_API_KEY=your_openrouter_api_key
+#   LLM_PROVIDER_OMLX_BASE_URL=http://127.0.0.1:8001/v1
+#   LLM_PROVIDER_OMLX_API_KEY=your_omlx_api_key
 
 LLM_DEFAULT_MODEL=deepseek/deepseek-v4-flash
+LLM_PROVIDER_NAME=OpenRouter
 LLM_CHAT_MODEL=deepseek/deepseek-v4-pro
 LLM_CONTEXT_MODEL=deepseek/deepseek-v4-flash
 LLM_CONTEXT_SUMMARY_MODEL=deepseek/deepseek-v4-flash
@@ -83,15 +78,9 @@ LLM_REWRITE_MODEL=gemma-4-26b-a4b-it-6bit
 LLM_PREFETCH_MODEL=deepseek/deepseek-v4-flash
 LLM_PREFETCH_SUMMARY_MODEL=gemma-4-26b-a4b-it-6bit
 
-# 기본 shared provider가 OpenRouter일 때만 별도로 로컬 oMLX에 보낼 helper task.
-# 모든 task가 shared provider를 쓰면 제거.
-LLM_REWRITE_PROVIDER_NAME=local-llm
-LLM_PREFETCH_SUMMARY_PROVIDER_NAME=local-llm
-
-# task별 cloud/API provider를 추가로 섞고 싶을 때만 사용.
-# LLM_PROVIDER_FIREWORKS_BASE_URL=https://api.fireworks.ai/inference/v1
-# LLM_PROVIDER_FIREWORKS_API_KEY=your_fireworks_api_key
-# LLM_ROUTER_PROVIDER_NAME=fireworks
+# Helper tasks can use the registered local provider while other tasks use LLM_PROVIDER_NAME.
+LLM_REWRITE_PROVIDER_NAME=oMLX
+LLM_PREFETCH_SUMMARY_PROVIDER_NAME=oMLX
 
 # reasoning policy
 LLM_CHAT_REASONING_EFFORT=xhigh
@@ -102,12 +91,13 @@ ENABLE_THINKING_FOR_CONTEXT=false
 LLM_PROVIDER_DATA_COLLECTION=deny
 LLM_REQUIRE_PARAMETERS=true
 LLM_ZERO_DATA_RETENTION=false
+# LLM_ALLOW_FALLBACKS=false
 
 TAVILY_API_KEY=your_tavily_api_key
 ENABLE_AUTO_SEARCH=true
 TELEGRAM_RESPONSE_DELIVERY=draft
 
-VAULT_CAPTURE_PATH=~/path/to/your/Vault/Capture
+VAULT_CAPTURE_PATH=~/Atelier/Vault/Capture
 INBOX_API_BASE_URL=http://localhost:8000
 # INBOX_API_ACCESS_TOKEN=your_inbox_access_token
 ENABLE_INBOX_CONTEXT_PREFETCH=true
@@ -127,10 +117,11 @@ ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION=false
 | `ENABLE_AUTO_SEARCH` | 기본값 `true`. 일반 메시지가 최신 정보가 필요한지 짧은 LLM 판정으로 확인하고 필요하면 Tavily 검색을 자동 주입 |
 | `AUTO_SEARCH_CLASSIFIER_TIMEOUT_SECONDS` | 기본값 `12`. 자동 검색 필요 여부를 판정하는 비스트리밍 LLM 호출 제한 시간 |
 | `TELEGRAM_RESPONSE_DELIVERY` | 기본값 `final`. `final`은 최종 답변을 새 메시지로 전송, `draft`는 `sendMessageDraft`, `edit`은 단일 메시지 `edit_text` 스트리밍 사용 |
-| `LLM_DEFAULT_BASE_URL` / `LLM_API_BASE_URL` | OpenAI-compatible LLM 서버의 기본 base URL. `LLM_API_BASE_URL`은 하위 호환 별칭 |
-| `LLM_DEFAULT_API_KEY` / `LLM_API_KEY` | 기본 LLM 서버 인증 키. `LLM_API_KEY`는 하위 호환 별칭 |
-| `OPENROUTER_API_KEY` | OpenRouter 하위 호환 API key. 기본 base URL이 `openrouter.ai`이면 기본 key보다 우선 |
-| `LLM_PROVIDER_NAME` | 봇 메시지에 표시할 LLM 제공자 이름, 기본값 `OMLX` |
+| `LLM_PROVIDER_<NAME>_BASE_URL` / `LLM_PROVIDER_<NAME>_API_KEY` | 공유 env의 provider registry. 예: `LLM_PROVIDER_OPENROUTER_BASE_URL`, `LLM_PROVIDER_OMLX_API_KEY` |
+| `LLM_DEFAULT_BASE_URL` / `LLM_API_BASE_URL` | legacy/simple-mode 기본 base URL. 새 설정에서는 provider registry와 task routing을 우선 사용 |
+| `LLM_DEFAULT_API_KEY` / `LLM_API_KEY` | legacy/simple-mode 기본 API key |
+| `OPENROUTER_API_KEY` | OpenRouter 하위 호환 API key |
+| `LLM_PROVIDER_NAME` | task별 provider override가 없을 때 사용할 기본 provider 이름. 예: `OpenRouter` |
 | `ALLOWED_USER_IDS` | 허용할 Telegram user id 목록, 쉼표 구분 |
 | `LLM_DEFAULT_MODEL` / `MODEL_NAME` | task별 모델이 없을 때 사용할 기본 모델 이름. `MODEL_NAME`은 하위 호환 별칭 |
 | `LLM_CHAT_MODEL` | 일반 대화와 활성 컨텍스트 없는 후속 질문에 사용할 모델 |
@@ -145,8 +136,7 @@ ENABLE_YOUTUBE_AUDIO_TRANSCRIPTION=false
 | `OMLX_BASE_URL` / `OMLX_MODEL` / `OMLX_API_KEY` | 각각 기본 base URL / 기본 model / 기본 API key보다 우선하는 OMLX 전용 별칭 |
 | `LLM_REASONING_EFFORT` | task별 reasoning effort가 없을 때 쓰는 기본값 |
 | `LLM_CHAT_REASONING_EFFORT` / `LLM_CONTEXT_REASONING_EFFORT` / `LLM_CONTEXT_SUMMARY_REASONING_EFFORT` / `LLM_CONTEXT_ANALYSIS_REASONING_EFFORT` / `LLM_ROUTER_REASONING_EFFORT` / `LLM_SUMMARY_REASONING_EFFORT` / `LLM_REWRITE_REASONING_EFFORT` / `LLM_PREFETCH_REASONING_EFFORT` / `LLM_PREFETCH_SUMMARY_REASONING_EFFORT` | task별 reasoning effort. 빈 값이면 fallback task 값, 그다음 기본값을 따름 |
-| `LLM_<TASK>_PROVIDER_NAME` | 특정 task만 다른 provider로 보낼 때 사용. 현재 `OpenRouter`와 `local-llm`/`oMLX`는 provider 이름만으로 기본 endpoint/key를 해석하며, 다른 이름은 `LLM_PROVIDER_<NAME>_BASE_URL` / `LLM_PROVIDER_<NAME>_API_KEY` registry로 등록 가능 |
-| `LLM_PROVIDER_<NAME>_BASE_URL` / `LLM_PROVIDER_<NAME>_API_KEY` | named provider registry. 예: `LLM_PROVIDER_FIREWORKS_BASE_URL`을 설정한 뒤 `LLM_ROUTER_PROVIDER_NAME=fireworks`로 참조 |
+| `LLM_<TASK>_PROVIDER_NAME` | 특정 task가 기본 provider 대신 사용할 provider registry 이름. 예: `LLM_REWRITE_PROVIDER_NAME=oMLX` |
 | `LLM_<TASK>_BASE_URL` / `LLM_<TASK>_API_KEY` | 특정 task의 endpoint/key를 직접 override할 때 사용. `<TASK>`는 `CHAT`, `CONTEXT`, `CONTEXT_SUMMARY`, `CONTEXT_ANALYSIS`, `ROUTER`, `SUMMARY`, `REWRITE`, `PREFETCH`, `PREFETCH_SUMMARY` |
 | `LLM_PROVIDER_DATA_COLLECTION` | OpenRouter provider routing의 `data_collection` 값. 데이터 수집 provider를 피하려면 `deny` |
 | `LLM_REQUIRE_PARAMETERS` | 기본값 `false`. `true`면 요청 parameter를 지원하는 provider로만 라우팅 |
